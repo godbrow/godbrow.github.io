@@ -1,26 +1,145 @@
 /* =========================================================
-   SDUI Markdown Editor — app.js (CORE v1)
-   Clean slate architecture
+   SDUI Block Editor Kernel v3
+   - Block-based model
+   - Virtualized editor
+   - Split / merge editing
+   - Preview renderer
 ========================================================= */
 
 /* =========================================================
-   STATE (Single Source of Truth)
+   STATE
 ========================================================= */
 
 const DocumentModel = {
-  text: "",
+  blocks: [],
 
-  set(value) {
-    this.text = value;
+  setBlocks(blocks) {
+    this.blocks = blocks;
   },
 
-  get() {
-    return this.text;
+  getBlocks() {
+    return this.blocks;
   }
 };
 
 /* =========================================================
-   SDUI RENDERER
+   BLOCK MODEL
+========================================================= */
+
+let globalBlockId = 0;
+
+function createBlock(type = "paragraph", text = "") {
+  return {
+    id: globalBlockId++,
+    type,
+    text
+  };
+}
+
+/* =========================================================
+   INITIAL PARSER (string → blocks)
+========================================================= */
+
+function parseToBlocks(text = "") {
+  const lines = text.split("\n");
+
+  const blocks = [];
+  let buffer = [];
+  let id = 0;
+
+  const flush = (type = "paragraph") => {
+    if (!buffer.length) return;
+
+    blocks.push({
+      id: id++,
+      type,
+      text: buffer.join("\n")
+    });
+
+    buffer = [];
+  };
+
+  for (const line of lines) {
+
+    if (line.startsWith("# ")) {
+      flush();
+      blocks.push({ id: id++, type: "h1", text: line.slice(2) });
+      continue;
+    }
+
+    if (line.startsWith("## ")) {
+      flush();
+      blocks.push({ id: id++, type: "h2", text: line.slice(3) });
+      continue;
+    }
+
+    if (line.startsWith("> ")) {
+      flush();
+      blocks.push({ id: id++, type: "quote", text: line.slice(2) });
+      continue;
+    }
+
+    buffer.push(line);
+  }
+
+  flush();
+
+  return blocks;
+}
+
+/* =========================================================
+   VIRTUALIZATION ENGINE
+========================================================= */
+
+const VirtualState = {
+  start: 0,
+  end: 0,
+  buffer: 6
+};
+
+function estimateHeight(block) {
+  const base = 28;
+  const lines = block.text.split("\n").length;
+  return base + lines * 18;
+}
+
+function computeVisibleRange(blocks, scrollTop, viewportHeight) {
+
+  let y = 0;
+  let start = 0;
+
+  for (let i = 0; i < blocks.length; i++) {
+    const h = estimateHeight(blocks[i]);
+
+    if (y + h > scrollTop) {
+      start = Math.max(0, i - VirtualState.buffer);
+      break;
+    }
+
+    y += h;
+  }
+
+  let end = start;
+  let h = 0;
+
+  while (end < blocks.length && h < viewportHeight) {
+    h += estimateHeight(blocks[end]);
+    end++;
+  }
+
+  VirtualState.start = start;
+  VirtualState.end = end + VirtualState.buffer;
+}
+
+/* =========================================================
+   DOM REFERENCES
+========================================================= */
+
+let editorPanel = null;
+let previewPanel = null;
+
+/* =========================================================
+   INIT SDUI (minimal semantic loader)
 ========================================================= */
 
 async function loadUI() {
@@ -31,137 +150,207 @@ async function loadUI() {
 }
 
 function renderNode(node, parent) {
-  let el;
-
   switch (node.type) {
 
     case "page":
-      node.children?.forEach(child =>
-        renderNode(child, parent)
-      );
-      return;
+      node.children?.forEach(c => renderNode(c, parent));
+      break;
 
     case "main":
-      el = document.querySelector("main");
-
-      node.children?.forEach(child =>
-        renderNode(child, el)
-      );
-      return;
+      const main = document.querySelector("main");
+      node.children?.forEach(c => renderNode(c, main));
+      break;
 
     case "section":
-      el = document.createElement("section");
-
-      if (node.role) {
-        el.setAttribute("role", node.role);
-      }
-
+      const el = document.createElement("section");
+      if (node.role) el.setAttribute("role", node.role);
       parent.appendChild(el);
-      node.el = el;
-      return;
-
-    default:
-      console.warn("Unknown SDUI node:", node);
+      break;
   }
 }
 
 /* =========================================================
-   EDITOR ENGINE (contentEditable root)
+   EDITOR RENDER (virtual blocks)
 ========================================================= */
 
-let editorPanel = null;
-let previewPanel = null;
+function renderEditorVirtual() {
 
-function initEditor() {
-  editorPanel = document.querySelector(
-    '[role="editor-panel"]'
-  );
+  const blocks = DocumentModel.getBlocks();
+  const container = editorPanel;
 
-  previewPanel = document.querySelector(
-    '[role="preview-panel"]'
-  );
+  container.innerHTML = "";
 
-  editorPanel.contentEditable = true;
-  editorPanel.spellcheck = false;
+  for (
+    let i = VirtualState.start;
+    i < VirtualState.end;
+    i++
+  ) {
+    const block = blocks[i];
+    if (!block) continue;
 
-  editorPanel.addEventListener("input", onEditorInput);
+    const el = document.createElement("div");
+
+    el.contentEditable = true;
+    el.dataset.id = block.id;
+    el.innerText = block.text;
+
+    el.addEventListener("input", () => {
+      block.text = el.innerText;
+
+      renderPreview();
+    });
+
+    el.addEventListener("keydown", (e) => {
+      handleBlockEditing(e, el, block);
+    });
+
+    container.appendChild(el);
+  }
 }
 
 /* =========================================================
-   INPUT HANDLER
+   BLOCK EDITING LOGIC (split / merge)
 ========================================================= */
 
-function onEditorInput() {
-  const value = editorPanel.innerText;
+function splitBlock(block, cursorPos) {
 
-  DocumentModel.set(value);
+  const before = block.text.slice(0, cursorPos);
+  const after = block.text.slice(cursorPos);
 
-  renderPreview();
+  block.text = before;
+
+  const newBlock = createBlock("paragraph", after);
+
+  const blocks = DocumentModel.getBlocks();
+  const index = blocks.indexOf(block);
+
+  blocks.splice(index + 1, 0, newBlock);
+
+  return newBlock;
 }
 
-/* =========================================================
-   MARKDOWN ENGINE (minimal core v1)
-========================================================= */
+function mergeWithPrevious(block) {
 
-function renderMarkdown(text) {
+  const blocks = DocumentModel.getBlocks();
+  const index = blocks.indexOf(block);
 
-  if (!text) return "";
+  if (index === 0) return null;
 
-  return text
-    .replace(/^###### (.*)$/gm, "<h6>$1</h6>")
-    .replace(/^##### (.*)$/gm, "<h5>$1</h5>")
-    .replace(/^#### (.*)$/gm, "<h4>$1</h4>")
-    .replace(/^### (.*)$/gm, "<h3>$1</h3>")
-    .replace(/^## (.*)$/gm, "<h2>$1</h2>")
-    .replace(/^# (.*)$/gm, "<h1>$1</h1>")
+  const prev = blocks[index - 1];
 
-    .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>")
-    .replace(/\*(.*?)\*/g, "<em>$1</em>")
-    .replace(/`([^`]+)`/g, "<code>$1</code>")
+  const cursorOffset = prev.text.length;
 
-    .replace(/^> (.*)$/gm, "<blockquote>$1</blockquote>")
+  prev.text += block.text;
 
-    .replace(/^\s*[-*] (.*)$/gm, "<li>$1</li>")
+  blocks.splice(index, 1);
 
-    .replace(/\n/g, "<br>");
+  return { block: prev, cursorOffset };
+}
+
+function handleBlockEditing(e, el, block) {
+
+  const cursorPos = el.innerText.length;
+
+  if (e.key === "Enter") {
+    e.preventDefault();
+
+    const newBlock = splitBlock(block, cursorPos);
+
+    scheduleRender();
+
+    focusBlock(newBlock);
+  }
+
+  if (e.key === "Backspace" && cursorPos === 0) {
+    e.preventDefault();
+
+    const result = mergeWithPrevious(block);
+
+    scheduleRender();
+
+    if (result) focusBlock(result.block);
+  }
+}
+
+function focusBlock(block) {
+  requestAnimationFrame(() => {
+    const el = editorPanel.querySelector(
+      `[data-id="${block.id}"]`
+    );
+
+    if (el) el.focus();
+  });
 }
 
 /* =========================================================
    PREVIEW RENDERER
 ========================================================= */
 
+function renderBlock(block) {
+
+  const text = block.text;
+
+  switch (block.type) {
+
+    case "h1":
+      return `<h1>${text}</h1>`;
+
+    case "h2":
+      return `<h2>${text}</h2>`;
+
+    case "quote":
+      return `<blockquote>${text}</blockquote>`;
+
+    default:
+      return `<p>${text}</p>`;
+  }
+}
+
 function renderPreview() {
-  if (!previewPanel) return;
 
-  const text = DocumentModel.get();
+  if (!previewPanel) {
+    previewPanel = document.querySelector('[role="preview-panel"]');
+  }
 
-  previewPanel.innerHTML = renderMarkdown(text);
+  const blocks = DocumentModel.getBlocks();
+
+  previewPanel.innerHTML =
+    blocks.map(renderBlock).join("");
 }
 
 /* =========================================================
-   SDUI THEME / SYSTEM HOOK (future-ready)
+   MAIN RENDER PIPELINE
 ========================================================= */
 
-const AppRuntime = {
-  theme: "system",
+function scheduleRender() {
 
-  setTheme(mode) {
-    this.theme = mode;
-    document.documentElement.dataset.theme = mode;
-  }
-};
+  const blocks = DocumentModel.getBlocks();
+
+  computeVisibleRange(
+    blocks,
+    editorPanel.scrollTop,
+    editorPanel.clientHeight
+  );
+
+  requestAnimationFrame(() => {
+    renderEditorVirtual();
+  });
+}
 
 /* =========================================================
-   SERVICE WORKER REGISTRATION
+   EDITOR INIT
 ========================================================= */
 
-function registerServiceWorker() {
-  if (!("serviceWorker" in navigator)) return;
+function initEditor() {
 
-  navigator.serviceWorker.register("./worker.js")
-    .catch(err => {
-      console.warn("SW registration failed:", err);
-    });
+  editorPanel = document.querySelector('[role="editor-panel"]');
+  previewPanel = document.querySelector('[role="preview-panel"]');
+
+  editorPanel.addEventListener("scroll", () => {
+    scheduleRender();
+  });
+
+  editorPanel.contentEditable = false;
 }
 
 /* =========================================================
@@ -169,19 +358,19 @@ function registerServiceWorker() {
 ========================================================= */
 
 async function init() {
+
   await loadUI();
 
   initEditor();
 
-  registerServiceWorker();
+  const initial = "";
 
-  DocumentModel.set("");
+  const blocks = parseToBlocks(initial);
 
+  DocumentModel.setBlocks(blocks);
+
+  scheduleRender();
   renderPreview();
 }
-
-/* =========================================================
-   START APP
-========================================================= */
 
 init();
