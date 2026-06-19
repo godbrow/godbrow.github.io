@@ -1,42 +1,26 @@
 
 /* =========================================================
-   SINGLE APP CORE (v12)
-   - unified state
-   - SDUI contract
-   - transaction engine
-   - normalization engine
+   SINGLE APP CORE (v13 STABLE)
 ========================================================= */
 
 const EditorApp = {
 
-  /* -------------------------
-     UI CONTRACT
-  ------------------------- */
   UI: {
     editorPanel: null,
     previewPanel: null
   },
 
-  /* -------------------------
-     STATE
-  ------------------------- */
   state: {
     blocks: [],
     blockCache: new Map(),
     activeBlockId: null
   },
 
-  /* -------------------------
-     CURSOR
-  ------------------------- */
   cursor: {
     blockId: null,
     offset: 0
   },
 
-  /* -------------------------
-     TRANSACTION TYPES
-  ------------------------- */
   TX: {
     UPDATE: "update",
     SPLIT: "split",
@@ -55,16 +39,11 @@ function createBlock(type = "paragraph", text = "") {
 }
 
 /* =========================================================
-   DOCUMENT HELPERS
+   STATE HELPERS
 ========================================================= */
 
-function getBlocks() {
-  return EditorApp.state.blocks;
-}
-
-function setBlocks(b) {
-  EditorApp.state.blocks = b;
-}
+const getBlocks = () => EditorApp.state.blocks;
+const setBlocks = (b) => EditorApp.state.blocks = b;
 
 /* =========================================================
    TRANSACTION ENGINE
@@ -101,24 +80,21 @@ const TransactionEngine = {
       }
 
       case EditorApp.TX.MERGE: {
-        const { block } = tx;
+        const blocks = getBlocks();
+        const idx = blocks.indexOf(tx.block);
 
-        const idx = blocks.indexOf(block);
-        if (idx === 0 && blocks.length > 1) {
-          const next = blocks[1];
-          next.text = block.text + next.text;
-          blocks.splice(idx, 1);
-          tx.result = next;
-          break;
-        }
+        if (idx === -1) return;
 
+        // merge upward if possible
         if (idx > 0) {
           const prev = blocks[idx - 1];
-          prev.text += block.text;
+
+          prev.text += tx.block.text;
+
           blocks.splice(idx, 1);
+
           tx.result = prev;
         }
-
         break;
       }
     }
@@ -140,13 +116,14 @@ const Normalizer = {
       return;
     }
 
-    for (let i = blocks.length - 1; i >= 1; i--) {
+    // remove consecutive empties
+    for (let i = blocks.length - 1; i > 0; i--) {
       if (blocks[i].text === "" && blocks[i - 1].text === "") {
-        blocks[i - 1].text += blocks[i].text;
         blocks.splice(i, 1);
       }
     }
 
+    // ensure safe strings
     for (const b of blocks) {
       if (b.text == null) b.text = "";
     }
@@ -154,26 +131,30 @@ const Normalizer = {
 };
 
 /* =========================================================
-   RENDER SCHEDULING
+   RENDER QUEUE
 ========================================================= */
 
 let editorQueued = false;
 let previewQueued = false;
 
 function queueEditorRender() {
+
   if (editorQueued) return;
 
   editorQueued = true;
 
   requestAnimationFrame(() => {
+
     editorQueued = false;
 
-    Normalizer.run();
+    Normalizer.run();   // IMPORTANT: BEFORE render
+
     renderEditor();
   });
 }
 
 function queuePreviewRender() {
+
   if (previewQueued) return;
 
   previewQueued = true;
@@ -185,7 +166,7 @@ function queuePreviewRender() {
 }
 
 /* =========================================================
-   CURSOR HELPERS
+   CURSOR SYSTEM (FIXED)
 ========================================================= */
 
 function saveCursor(el, block) {
@@ -196,26 +177,28 @@ function saveCursor(el, block) {
 function restoreCursor() {
 
   requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
 
-    const el = EditorApp.UI.editorPanel.querySelector(
-      `[data-id="${EditorApp.cursor.blockId}"]`
-    );
-
-    if (!el) return;
-
-    el.focus();
-
-    try {
-      el.setSelectionRange(
-        EditorApp.cursor.offset,
-        EditorApp.cursor.offset
+      const el = EditorApp.UI.editorPanel.querySelector(
+        `[data-id="${EditorApp.cursor.blockId}"]`
       );
-    } catch {}
+
+      if (!el) return;
+
+      el.focus();
+
+      try {
+        el.setSelectionRange(
+          EditorApp.cursor.offset,
+          EditorApp.cursor.offset
+        );
+      } catch {}
+    });
   });
 }
 
 /* =========================================================
-   SDUI LAYER
+   SDUI LOADER
 ========================================================= */
 
 async function loadUI() {
@@ -262,7 +245,7 @@ function buildUI(node, parent) {
 }
 
 /* =========================================================
-   EDITOR
+   EDITOR BLOCK
 ========================================================= */
 
 function createBlockElement(block) {
@@ -294,9 +277,7 @@ function createBlockElement(block) {
     queueEditorRender();
   });
 
-  el.addEventListener("keydown", (e) =>
-    handleKey(e, el, block)
-  );
+  el.addEventListener("keydown", (e) => handleKey(e, el, block));
 
   return el;
 }
@@ -341,7 +322,7 @@ function renderEditor() {
 }
 
 /* =========================================================
-   KEY HANDLER
+   KEY HANDLER (FIXED BACKSPACE)
 ========================================================= */
 
 function handleKey(e, el, block) {
@@ -368,41 +349,33 @@ function handleKey(e, el, block) {
     restoreCursor();
     return;
   }
-if (e.key === "Backspace") {
 
-  const pos = el.selectionStart ?? el.innerText.length;
+  if (e.key === "Backspace") {
 
-  if (pos === 0) {
-    e.preventDefault();
+    if (pos === 0) {
+      e.preventDefault();
 
-    let tx = {
-      type: EditorApp.TX.MERGE,
-      block
-    };
+      const tx = {
+        type: EditorApp.TX.MERGE,
+        block
+      };
 
-    TransactionEngine.apply(tx);
+      TransactionEngine.apply(tx);
 
-    // 🔥 CHAIN COLLAPSE (important fix)
-    Normalizer.run();
+      queueEditorRender();
+      queuePreviewRender();
 
-    queueEditorRender();
-    queuePreviewRender();
+      if (tx.result) {
 
-    if (tx.result) {
+        EditorApp.cursor.blockId = tx.result.id;
 
-      EditorApp.cursor.blockId = tx.result.id;
+        // FIX: always jump to end of merged block
+        EditorApp.cursor.offset = tx.result.text.length;
 
-      // FIX: always force END of previous block
-      EditorApp.cursor.offset = tx.result.text.length;
-
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          restoreCursor();
-        });
-      });
+        restoreCursor();
+      }
     }
   }
-}
 }
 
 /* =========================================================
