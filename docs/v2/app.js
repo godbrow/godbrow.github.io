@@ -1,13 +1,14 @@
 /* =========================================================
-   SDUI Block Editor Kernel v4
-   - Block-based model
-   - Virtualized editor
+   SDUI Block Editor Kernel v5
+   - Block model (source of truth)
+   - Virtualized + DOM reuse editor
+   - Cursor-safe editing
    - Plugin system with lifecycle
-   - Async-safe rendering
+   - Markdown plugin restored
 ========================================================= */
 
 /* =========================================================
-   DOCUMENT MODEL (SOURCE OF TRUTH)
+   DOCUMENT MODEL
 ========================================================= */
 
 const DocumentModel = {
@@ -37,7 +38,7 @@ function createBlock(type = "paragraph", text = "") {
 }
 
 /* =========================================================
-   INITIAL PARSER (text → blocks)
+   INITIAL PARSER
 ========================================================= */
 
 function parseToBlocks(text = "") {
@@ -88,7 +89,7 @@ function parseToBlocks(text = "") {
 }
 
 /* =========================================================
-   VIRTUALIZATION ENGINE
+   VIRTUAL RANGE
 ========================================================= */
 
 const VirtualState = {
@@ -98,9 +99,7 @@ const VirtualState = {
 };
 
 function estimateHeight(block) {
-  const base = 28;
-  const lines = block.text.split("\n").length;
-  return base + lines * 18;
+  return 28 + block.text.split("\n").length * 18;
 }
 
 function computeVisibleRange(blocks, scrollTop, viewportHeight) {
@@ -132,7 +131,40 @@ function computeVisibleRange(blocks, scrollTop, viewportHeight) {
 }
 
 /* =========================================================
-   PLUGIN SYSTEM CORE
+   CURSOR STATE (CRITICAL FIX)
+========================================================= */
+
+const CursorState = {
+  blockId: null,
+  offset: 0
+};
+
+function saveCursor(el, block) {
+  CursorState.blockId = block.id;
+  CursorState.offset = el.selectionStart ?? el.innerText.length;
+}
+
+function restoreCursor() {
+  requestAnimationFrame(() => {
+
+    const { blockId, offset } = CursorState;
+
+    if (blockId == null) return;
+
+    const el = editorPanel.querySelector(`[data-id="${blockId}"]`);
+
+    if (!el) return;
+
+    el.focus();
+
+    try {
+      el.setSelectionRange?.(offset, offset);
+    } catch {}
+  });
+}
+
+/* =========================================================
+   PLUGIN SYSTEM
 ========================================================= */
 
 const PluginRegistry = {
@@ -156,9 +188,7 @@ class PluginInstance {
   }
 
   ctx() {
-    return {
-      signal: this.abortController.signal
-    };
+    return { signal: this.abortController.signal };
   }
 
   mount() {
@@ -179,6 +209,12 @@ class PluginInstance {
 const PluginInstances = new Map();
 
 /* =========================================================
+   DOM CACHE (IMPORTANT OPTIMIZATION)
+========================================================= */
+
+const BlockDOMCache = new Map();
+
+/* =========================================================
    DOM REFERENCES
 ========================================================= */
 
@@ -186,7 +222,7 @@ let editorPanel = null;
 let previewPanel = null;
 
 /* =========================================================
-   SDUI LOADER (minimal)
+   SDUI LOADER
 ========================================================= */
 
 async function loadUI() {
@@ -218,13 +254,12 @@ function renderNode(node, parent) {
 }
 
 /* =========================================================
-   PLUGIN RUNTIME
+   PLUGINS RUNTIME
 ========================================================= */
 
 function runPlugin(block, el) {
 
   const plugin = PluginRegistry.get(block.type);
-
   if (!plugin) return;
 
   const existing = PluginInstances.get(block.id);
@@ -243,25 +278,22 @@ function runPlugin(block, el) {
 
 function cleanupPlugins(activeIds) {
 
-  for (const [id, instance] of PluginInstances.entries()) {
-
+  for (const [id, inst] of PluginInstances.entries()) {
     if (!activeIds.has(id)) {
-      instance.destroy();
+      inst.destroy();
       PluginInstances.delete(id);
     }
   }
 }
 
 /* =========================================================
-   EDITOR (VIRTUAL RENDER)
+   EDITOR (VIRTUAL + DOM REUSE)
 ========================================================= */
 
 function renderEditorVirtual() {
 
   const blocks = DocumentModel.getBlocks();
   const container = editorPanel;
-
-  container.innerHTML = "";
 
   const activeIds = new Set();
 
@@ -275,22 +307,43 @@ function renderEditorVirtual() {
 
     activeIds.add(block.id);
 
-    const el = document.createElement("div");
+    let el = BlockDOMCache.get(block.id);
 
-    el.contentEditable = true;
-    el.dataset.id = block.id;
+    if (!el) {
+      el = document.createElement("div");
+
+      el.contentEditable = true;
+      el.dataset.id = block.id;
+
+      el.addEventListener("input", () => {
+        saveCursor(el, block);
+
+        block.text = el.innerText;
+
+        syncPreviewBlock(block);
+
+        scheduleRender();
+
+        restoreCursor();
+      });
+
+      el.addEventListener("keydown", (e) => {
+        handleBlockEditing(e, el, block);
+      });
+
+      BlockDOMCache.set(block.id, el);
+    }
+
     el.innerText = block.text;
 
-    el.addEventListener("input", () => {
-      block.text = el.innerText;
-      syncPreviewBlock(block);
-    });
-
-    el.addEventListener("keydown", (e) => {
-      handleBlockEditing(e, el, block);
-    });
-
     container.appendChild(el);
+  }
+
+  for (const [id, el] of BlockDOMCache.entries()) {
+    if (!activeIds.has(id)) {
+      el.remove();
+      BlockDOMCache.delete(id);
+    }
   }
 }
 
@@ -343,7 +396,7 @@ function handleBlockEditing(e, el, block) {
     scheduleRender();
     renderPreview();
 
-    focusBlock(newBlock);
+    restoreCursor();
   }
 
   if (e.key === "Backspace" && cursorPos === 0) {
@@ -354,23 +407,12 @@ function handleBlockEditing(e, el, block) {
     scheduleRender();
     renderPreview();
 
-    if (prev) focusBlock(prev);
+    if (prev) restoreCursor();
   }
 }
 
-function focusBlock(block) {
-
-  requestAnimationFrame(() => {
-    const el = editorPanel.querySelector(
-      `[data-id="${block.id}"]`
-    );
-
-    el?.focus();
-  });
-}
-
 /* =========================================================
-   PREVIEW + PLUGINS
+   PREVIEW SYSTEM
 ========================================================= */
 
 function renderBlock(block) {
@@ -422,15 +464,15 @@ function syncPreviewBlock(block) {
 
   if (!el) return;
 
-  const instance = PluginInstances.get(block.id);
+  const inst = PluginInstances.get(block.id);
 
-  if (instance) {
-    instance.update(block);
+  if (inst) {
+    inst.update(block);
   }
 }
 
 /* =========================================================
-   VIRTUAL RENDER PIPELINE
+   RENDER PIPELINE
 ========================================================= */
 
 function scheduleRender() {
@@ -449,7 +491,35 @@ function scheduleRender() {
 }
 
 /* =========================================================
-   EDITOR INIT
+   MARKDOWN PLUGIN (FIXED CORE ISSUE)
+========================================================= */
+
+function renderMarkdown(text) {
+
+  if (!text) return "";
+
+  return text
+    .replace(/^###### (.*)$/gm, "<h6>$1</h6>")
+    .replace(/^##### (.*)$/gm, "<h5>$1</h5>")
+    .replace(/^#### (.*)$/gm, "<h4>$1</h4>")
+    .replace(/^### (.*)$/gm, "<h3>$1</h3>")
+    .replace(/^## (.*)$/gm, "<h2>$1</h2>")
+    .replace(/^# (.*)$/gm, "<h1>$1</h1>")
+    .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*(.*?)\*/g, "<em>$1</em>")
+    .replace(/`([^`]+)`/g, "<code>$1</code>");
+}
+
+PluginRegistry.register({
+  type: "paragraph",
+
+  render(block) {
+    return renderMarkdown(block.text);
+  }
+});
+
+/* =========================================================
+   INIT
 ========================================================= */
 
 function initEditor() {
@@ -462,19 +532,13 @@ function initEditor() {
   });
 }
 
-/* =========================================================
-   BOOTSTRAP
-========================================================= */
-
 async function init() {
 
   await loadUI();
 
   initEditor();
 
-  const initial = "";
-
-  const blocks = parseToBlocks(initial);
+  const blocks = parseToBlocks("");
 
   DocumentModel.setBlocks(blocks);
 
