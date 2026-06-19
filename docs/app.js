@@ -357,68 +357,43 @@ class List {
   }
 }
 
-// ---------- Edit (virtualised editor, fixed input & line ops) ----------
+// ---------- Edit (contenteditable pre, native cursor) ----------
 class Edit {
-  #store; #doc; #lines; #heights; #scroll; #gutter; #textarea;
-  #history; #parser; #cursor; #pool; #sentinel; #caret;
-  #focused = false; #composing = false; #composeStartText = '';
-  #cursors = new Map();   // per‑document cursor memory
+  #store; #doc; #lines; #heights; #scroll; #gutter; #pre;
+  #history; #parser; #cursor; #cursors; #idle;
+  #composing = false;
 
   constructor(store, main) {
     this.#store = store;
     this.#gutter = main.querySelector('.gutter');
     this.#scroll = main.querySelector('.content');
-    this.#textarea = this.#makeTextarea();
-    this.#scroll.appendChild(this.#textarea);
-    this.#pool = [];
-    this.#heights = [];
-    this.#lines = [];
+    this.#cursors = new Map();
     this.#cursor = { line: 0, col: 0 };
     this.#history = new History();
-    this.#sentinel = document.createElement('div');
-    this.#sentinel.className = 'sentinel';
-    this.#scroll.appendChild(this.#sentinel);
 
-    // Blinking cursor element
-    this.#caret = document.createElement('span');
-    this.#caret.className = 'caret';
-    this.#caret.style.cssText = 'position:absolute;width:2px;height:var(--line-height);background:var(--text);display:none;pointer-events:none;z-index:2;';
-    this.#scroll.appendChild(this.#caret);
+    // Create contenteditable pre (replaces hidden textarea)
+    this.#pre = document.createElement('pre');
+    this.#pre.className = 'edit';
+    this.#pre.setAttribute('contenteditable', 'true');
+    this.#pre.setAttribute('spellcheck', 'false');
+    this.#pre.style.cssText = 'white-space:pre-wrap;word-wrap:break-word;margin:0;outline:none;min-height:100%;';
+    this.#scroll.appendChild(this.#pre);
 
-    this.#scroll.addEventListener('scroll', () => this.#render());
-    this.#scroll.addEventListener('mousedown', (e) => this.#onMouseDown(e));
-    this.#textarea.addEventListener('keydown', (e) => this.#onKey(e));
-    this.#textarea.addEventListener('focus', () => { this.#focused = true; this.#showCaret(); });
-    this.#textarea.addEventListener('blur', () => { this.#focused = false; this.#hideCaret(); });
-
-    this.#textarea.addEventListener('compositionstart', () => {
-      this.#composing = true;
-      this.#composeStartText = this.#lines[this.#cursor.line] || '';
-    });
-    this.#textarea.addEventListener('compositionend', (e) => {
+    this.#pre.addEventListener('keydown', (e) => this.#onKey(e));
+    this.#pre.addEventListener('input', (e) => this.#onInput(e));
+    this.#pre.addEventListener('compositionstart', () => { this.#composing = true; });
+    this.#pre.addEventListener('compositionend', (e) => {
       this.#composing = false;
-      const composed = e.data || '';
-      const { line, col } = this.#cursor;
-      const oldLine = this.#composeStartText;
-      if (composed !== oldLine) {
-        const startOff = this.#offsetFromLineCol(line, 0);
-        const del = new Delete(startOff, oldLine);
-        this.#applyCommand(del);
-        const ins = new Insert(startOff, composed);
-        this.#applyCommand(ins);
-        this.#setCursor(line, composed.length);
-      }
+      // Let the input handler deal with the final text
+      this.#onInput(e);
     });
+    // Focus/blur for caret styling
+    this.#pre.addEventListener('focus', () => this.#scroll.classList.add('focused'));
+    this.#pre.addEventListener('blur', () => this.#scroll.classList.remove('focused'));
 
     store.subscribe((action) => {
       if (action === 'active' || action === 'docs') this.refresh();
     });
-  }
-
-  #makeTextarea() {
-    const ta = document.createElement('textarea');
-    ta.style.cssText = 'position:absolute;opacity:0;pointer-events:none;width:1px;height:1px;left:0;top:0;z-index:1;';
-    return ta;
   }
 
   refresh() {
@@ -429,131 +404,93 @@ class Edit {
     this.#doc = doc;
     const text = this.#store.text(id);
     this.#lines = text.split('\n');
-    this.#heights = new Array(this.#lines.length).fill(24);
     this.#history = new History();
     this.#parser = {
       plugin: plug[doc.mode] || plug.txt,
       ctx: (plug[doc.mode] || plug.txt).start()
     };
 
-    // Restore previous cursor if we have one for this document
+    // Restore previous cursor
     const saved = this.#cursors.get(id);
     if (saved) {
       this.#cursor = { line: saved.line, col: saved.col };
     } else {
       this.#cursor = { line: 0, col: 0 };
     }
-    // Ensure cursor is within bounds
+    // Clamp to document bounds
     if (this.#cursor.line >= this.#lines.length)
       this.#cursor.line = Math.max(0, this.#lines.length - 1);
     if (this.#cursor.col > (this.#lines[this.#cursor.line] || '').length)
       this.#cursor.col = (this.#lines[this.#cursor.line] || '').length;
 
-    this.#clearPool();
-    this.#render();
-    this.#setCursor(this.#cursor.line, this.#cursor.col);
-    this.#textarea.focus();
+    this.#renderAll();
+    this.#restoreCursor();
+    this.#pre.focus();
   }
 
-  #clearPool() {
-    this.#pool.forEach(el => el.remove());
-    this.#pool = [];
-  }
-
-  #render() {
-    const scrollTop = this.#scroll.scrollTop;
-    const viewHeight = this.#scroll.clientHeight;
-    let start = 0, end = 0, acc = 0;
-    for (let i = 0; i < this.#lines.length; i++) {
-      const h = this.#heights[i] || 24;
-      if (acc + h > scrollTop) { start = i; break; }
-      acc += h;
-    }
-    acc = 0;
-    for (let i = start; i < this.#lines.length; i++) {
-      const h = this.#heights[i] || 24;
-      acc += h;
-      if (acc > viewHeight + 200) { end = i; break; }
-      if (i === this.#lines.length - 1) end = i;
-    }
-
-    this.#clearPool();
+  // Render the entire document into the contenteditable pre (non-virtualised for now)
+  #renderAll() {
     const frag = document.createDocumentFragment();
-    const gutterFrag = document.createDocumentFragment();
-
-    // Gutter numbers
-    for (let i = start; i <= end; i++) {
-      const lineNum = document.createElement('div');
-      lineNum.textContent = i + 1;
-      lineNum.style.height = `${this.#heights[i] || 24}px`;
-      lineNum.style.lineHeight = `${this.#heights[i] || 24}px`;
-      gutterFrag.appendChild(lineNum);
+    for (let i = 0; i < this.#lines.length; i++) {
+      const section = this.#renderLine(i);
+      frag.appendChild(section);
     }
-    this.#gutter.innerHTML = '';
-    this.#gutter.appendChild(gutterFrag);
+    this.#pre.innerHTML = '';
+    this.#pre.appendChild(frag);
+  }
 
-    // Lines (no duplicate line numbers)
-    for (let i = start; i <= end; i++) {
-      const lineEl = document.createElement('div');
-      lineEl.className = 'line';
-      lineEl.style.top = `${this.#offset(i)}px`;
-      lineEl.dataset.line = i;
+  // Render a single line as a <div> with token spans and a <br>-based line feed
+  #renderLine(lineIndex) {
+    const div = document.createElement('div');
+    div.className = 'section';   // corresponds to StackEdit's cledit-section
+    div.dataset.line = lineIndex;
 
-      const blockKind = this.#detectBlockKind(i);
-      if (blockKind) lineEl.classList.add(blockKind);
+    const blockKind = this.#detectBlockKind(lineIndex);
+    if (blockKind) div.classList.add(blockKind);
 
-      const textSpan = document.createElement('span');
-      textSpan.className = 'text';
-      const tokens = this.#tokenizeLine(i);
+    // Token spans
+    const tokens = this.#tokenizeLine(lineIndex);
+    const textSpan = document.createElement('span');
+    textSpan.className = 'text';
+    tokens.forEach(tok => {
+      const span = document.createElement('span');
+      span.className = tok.kind;   // e.g., keyword, string, marker, text
+      span.textContent = tok.span;
+      textSpan.appendChild(span);
+    });
+    div.appendChild(textSpan);
+
+    // Line feed (br) – required for contenteditable to have line breaks
+    const lf = document.createElement('span');
+    lf.className = 'lf';
+    lf.innerHTML = '<br>';       // actual <br> element
+    div.appendChild(lf);
+
+    return div;
+  }
+
+  // Re‑highlight all visible sections (called after editing)
+  #rehighlight() {
+    const sections = this.#pre.querySelectorAll('.section');
+    sections.forEach((div) => {
+      const lineIndex = parseInt(div.dataset.line, 10);
+      if (isNaN(lineIndex)) return;
+      // Replace text span content with new tokens
+      const textSpan = div.querySelector('.text');
+      if (!textSpan) return;
+      textSpan.innerHTML = '';
+      const tokens = this.#tokenizeLine(lineIndex);
       tokens.forEach(tok => {
         const span = document.createElement('span');
         span.className = tok.kind;
         span.textContent = tok.span;
         textSpan.appendChild(span);
       });
-
-      lineEl.appendChild(textSpan);   // only the text span, no .num
-      frag.appendChild(lineEl);
-      this.#pool.push(lineEl);
-    }
-
-    this.#scroll.appendChild(frag);
-    this.#sentinel.style.height = `${this.#offset(this.#lines.length)}px`;
-
-    // Reposition caret after render if focused
-    if (this.#focused) this.#showCaret();
-  }
-
-  #offset(untilLine) {
-    let o = 0;
-    for (let i = 0; i < untilLine; i++) o += this.#heights[i] || 24;
-    return o;
-  }
-
-  #offsetFromLineCol(line, col) {
-    let off = 0;
-    for (let i = 0; i < line; i++) off += this.#lines[i].length + 1;
-    off += col;
-    return off;
-  }
-
-  #lineColFromOffset(off) {
-    let l = 0, c = 0, acc = 0;
-    while (l < this.#lines.length) {
-      const lineLen = this.#lines[l].length;
-      if (acc + lineLen >= off) { c = off - acc; break; }
-      acc += lineLen + 1;
-      l++;
-    }
-    if (l >= this.#lines.length) { l = this.#lines.length - 1; c = this.#lines[l].length; }
-    return { line: l, col: Math.min(c, this.#lines[l].length) };
-  }
-
-  #tokenizeLine(lineIndex) {
-    const plugin = this.#parser.plugin;
-    const ctx = plugin.start();
-    for (let i = 0; i < lineIndex; i++) plugin.line(this.#lines[i], ctx);
-    return plugin.line(this.#lines[lineIndex], ctx);
+      // Update block class
+      div.className = 'section';  // reset
+      const blockKind = this.#detectBlockKind(lineIndex);
+      if (blockKind) div.classList.add(blockKind);
+    });
   }
 
   #detectBlockKind(lineIndex) {
@@ -565,259 +502,144 @@ class Edit {
     return 'para';
   }
 
-  // ---------- Precise click handling ----------
-  #onMouseDown(e) {
-    const lineEl = e.target.closest('.line');
-    if (!lineEl) return;
-    const line = parseInt(lineEl.dataset.line, 10);
-    const textSpan = lineEl.querySelector('.text');
-    if (!textSpan) {
-      this.#setCursor(line, 0);
-      this.#textarea.focus();
-      return;
-    }
-
-    // X coordinate relative to the text span
-    const rect = textSpan.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-
-    // Use token bounding boxes to find the exact column
-    const col = this.#columnAtX(textSpan, x);
-    this.#setCursor(line, Math.min(col, (this.#lines[line] || '').length));
-    this.#textarea.focus();
+  #tokenizeLine(lineIndex) {
+    const plugin = this.#parser.plugin;
+    const ctx = plugin.start();
+    for (let i = 0; i < lineIndex; i++) plugin.line(this.#lines[i], ctx);
+    return plugin.line(this.#lines[lineIndex], ctx);
   }
 
-  // Returns the character column inside textSpan for a horizontal offset x (in pixels).
-  #columnAtX(textSpan, x) {
+  // Save current cursor position from contenteditable DOM to model
+  #saveCursor() {
+    const sel = window.getSelection();
+    if (!sel.rangeCount) return;
+    const node = sel.anchorNode;
+    const section = node?.parentElement?.closest('.section');
+    if (!section) return;
+    const line = parseInt(section.dataset.line, 10);
+    // Find column by counting characters before the cursor within the .text span
+    const textSpan = section.querySelector('.text');
     let col = 0;
-    const children = textSpan.children;
-    for (const child of children) {
-      const childRect = child.getBoundingClientRect();
-      const childLeft = childRect.left - textSpan.getBoundingClientRect().left;
-      const childRight = childRect.right - textSpan.getBoundingClientRect().left;
-
-      if (x >= childLeft && x <= childRight) {
-        // Inside this token – find exact offset
-        const offsetX = x - childLeft;
-        const text = child.textContent;
-        // Binary search within the text node for the character boundary
-        let low = 0, high = text.length;
-        while (low < high) {
-          const mid = Math.floor((low + high) / 2);
-          const range = document.createRange();
-          // child should contain a text node (the only child)
-          const textNode = child.firstChild;
-          if (!textNode) break;
-          range.setStart(textNode, 0);
-          range.setEnd(textNode, mid);
-          const rect = range.getBoundingClientRect();
-          const width = rect.width;
-          if (width > offsetX) {
-            high = mid;
-          } else {
-            low = mid + 1;
-          }
-        }
-        return col + low;
-      } else if (x > childRight) {
-        col += child.textContent.length;
-      } else {
-        // x is left of this token – stop (should not happen as we iterate left->right)
-        break;
+    if (textSpan) {
+      const walker = document.createTreeWalker(textSpan, NodeFilter.SHOW_TEXT);
+      let current = walker.nextNode();
+      while (current && current !== node) {
+        col += current.textContent.length;
+        current = walker.nextNode();
+      }
+      if (current === node) {
+        col += sel.anchorOffset;
       }
     }
-    // Click after all tokens → end of line
-    return col;
-  }
-
-  // ---------- Cursor rendering ----------
-  #setCursor(line, col) {
     this.#cursor = { line, col };
-    const lineText = this.#lines[line] || '';
-    this.#textarea.value = lineText;
-    this.#textarea.setSelectionRange(col, col);
-    // Keep line in view
-    const targetY = this.#offset(line);
-    this.#scroll.scrollTop = targetY - this.#scroll.clientHeight / 2;
-    // Remember position for this document
     if (this.#doc) this.#cursors.set(this.#doc.id, { line, col });
-    if (this.#focused) this.#showCaret();
   }
 
-  #showCaret() {
-    if (!this.#doc) return;
+  // Restore cursor from model into contenteditable
+  #restoreCursor() {
     const { line, col } = this.#cursor;
-    const lineEl = this.#pool.find(el => parseInt(el.dataset.line) === line);
-    if (!lineEl) { this.#caret.style.display = 'none'; return; }
-    const textSpan = lineEl.querySelector('.text');
-    if (!textSpan) { this.#caret.style.display = 'none'; return; }
-
-    const baseLeft = textSpan.offsetLeft;               // left of .text inside .content
-    const x = this.#getColumnPixel(textSpan, col);      // width of text before col
-    const lineTop = parseFloat(lineEl.style.top);
-    const lineHeight = this.#heights[line] || 24;
-
-    this.#caret.style.display = 'block';
-    this.#caret.style.left = `${baseLeft + x}px`;
-    this.#caret.style.top = `${lineTop}px`;
-    this.#caret.style.height = `${lineHeight}px`;
-  }
-
-  #hideCaret() {
-    this.#caret.style.display = 'none';
-  }
-
-  // Returns the pixel offset inside textSpan for a given column (0‑based)
-  #getColumnPixel(textSpan, col) {
-    let cur = 0;
-    let x = 0;
-    for (const child of textSpan.children) {
-      const len = child.textContent.length;
-      if (cur + len > col) {
-        // Inside this token
-        const offset = col - cur;
-        const range = document.createRange();
-        const textNode = child.firstChild;
-        if (textNode) {
-          range.setStart(textNode, 0);
-          range.setEnd(textNode, offset);
-        }
-        x += range.getBoundingClientRect().width;
-        break;
-      } else {
-        x += child.getBoundingClientRect().width;
-        cur += len;
-      }
+    const section = this.#pre.querySelector(`.section[data-line="${line}"]`);
+    if (!section) return;
+    const textSpan = section.querySelector('.text');
+    if (!textSpan) return;
+    let offset = col;
+    const walker = document.createTreeWalker(textSpan, NodeFilter.SHOW_TEXT);
+    let node = walker.nextNode();
+    while (node && offset > node.textContent.length) {
+      offset -= node.textContent.length;
+      node = walker.nextNode();
     }
-    return x;
+    if (node) {
+      const sel = window.getSelection();
+      const range = document.createRange();
+      range.setStart(node, Math.min(offset, node.textContent.length));
+      range.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }
   }
 
-  // ---------- Keyboard ----------
-  #onKey(e) {
+  // ---------- Input handling (contentEditable fires 'input') ----------
+  #onInput(e) {
     if (this.#composing) return;
-    const { line, col } = this.#cursor;
-    const key = e.key;
-
-    if (key === 'ArrowUp') {
-      e.preventDefault();
-      if (line > 0) this.#setCursor(line - 1, Math.min(col, (this.#lines[line-1] || '').length));
-      return;
-    }
-    if (key === 'ArrowDown') {
-      e.preventDefault();
-      if (line < this.#lines.length - 1) this.#setCursor(line + 1, Math.min(col, (this.#lines[line+1] || '').length));
-      return;
-    }
-    if (key === 'ArrowLeft') {
-      e.preventDefault();
-      if (col > 0) this.#setCursor(line, col - 1);
-      else if (line > 0) this.#setCursor(line - 1, (this.#lines[line - 1] || '').length);
-      return;
-    }
-    if (key === 'ArrowRight') {
-      e.preventDefault();
-      if (col < (this.#lines[line] || '').length) this.#setCursor(line, col + 1);
-      else if (line < this.#lines.length - 1) this.#setCursor(line + 1, 0);
-      return;
-    }
-    if (key === 'Home') { e.preventDefault(); this.#setCursor(line, 0); return; }
-    if (key === 'End') { e.preventDefault(); this.#setCursor(line, (this.#lines[line] || '').length); return; }
-
-    if (key === 'Backspace') {
-      e.preventDefault();
-      if (col > 0) {
-        const off = this.#offsetFromLineCol(line, col - 1);
-        const deleted = this.#doc.text.charAt(off);
-        const cmd = new Delete(off, deleted);
-        this.#applyCommand(cmd);
-        this.#setCursor(line, col - 1);
-      } else if (line > 0) {
-        const prevLineLen = this.#lines[line - 1].length;
-        const off = this.#offsetFromLineCol(line - 1, prevLineLen);
-        const cmd = new Delete(off, '\n');
-        this.#applyCommand(cmd);
-        this.#setCursor(line - 1, prevLineLen);
-      }
-      return;
-    }
-    if (key === 'Delete') {
-      e.preventDefault();
-      if (col < (this.#lines[line] || '').length) {
-        const off = this.#offsetFromLineCol(line, col);
-        const deleted = this.#doc.text.charAt(off);
-        const cmd = new Delete(off, deleted);
-        this.#applyCommand(cmd);
-        this.#setCursor(line, col);
-      } else if (line < this.#lines.length - 1) {
-        const off = this.#offsetFromLineCol(line, this.#lines[line].length);
-        const cmd = new Delete(off, '\n');
-        this.#applyCommand(cmd);
-        this.#setCursor(line, col);
-      }
-      return;
-    }
-    if (key === 'Enter') {
-      e.preventDefault();
-      const off = this.#offsetFromLineCol(line, col);
-      const cmd = new Insert(off, '\n');
-      this.#applyCommand(cmd);
-      this.#setCursor(line + 1, 0);
-      return;
-    }
-    if (key === 'z' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); this.#undo(); return; }
-    if (key === 'y' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); this.#redo(); return; }
-
-    if (key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
-      e.preventDefault();
-      const off = this.#offsetFromLineCol(line, col);
-      const cmd = new Insert(off, key);
-      this.#applyCommand(cmd);
-      this.#setCursor(line, col + 1);
-    }
+    // Extract plain text from contenteditable
+    const raw = this.#pre.innerText;   // innerText gives us the raw text with newlines
+    // innerText in a pre typically keeps newlines as \n
+    const newText = raw.replace(/\n$/, '');  // trailing newline might be extra
+    if (newText === this.#doc.text) return;  // no change
+    const oldText = this.#doc.text;
+    // Create a command – we use a "replace all" for simplicity (undo knows old text)
+    // For fine‑grained undo we'd diff, but for v1 we replace the whole document.
+    const cmd = new Replace(this.#doc.id, oldText, newText);
+    this.#applyCommand(cmd);
   }
 
+  // Replace command (holds old and new full text)
+  class Replace {
+    constructor(id, oldText, newText) {
+      this.id = id;
+      this.old = oldText;
+      this.new = newText;
+    }
+    apply(doc) { return this.new; }
+    undo(doc) { return this.old; }
+  }
+
+  // Apply a command and update everything
   #applyCommand(cmd) {
-    const oldText = this.#store.text(this.#doc.id);
-    const newText = cmd.apply(oldText);
-    this.#store.save(this.#doc.id, newText);
-    this.#doc.text = newText;
-    this.#lines = newText.split('\n');
-    this.#heights = new Array(this.#lines.length).fill(24);
-    this.#history.push(cmd);
-    this.#store.dispatch('doc', { id: this.#doc.id, text: newText });  // notify preview etc.
-    this.#render();
+    if (cmd instanceof Replace) {
+      const newText = cmd.new;
+      this.#store.save(this.#doc.id, newText);
+      this.#doc.text = newText;
+      this.#lines = newText.split('\n');
+      this.#history.push(cmd);
+      this.#store.dispatch('doc', { id: this.#doc.id, text: newText });
+      // Re‑render and keep cursor
+      this.#saveCursor();          // save before render
+      this.#renderAll();
+      this.#rehighlight();        // highlight is already in renderAll, but double safe
+      this.#restoreCursor();
+    }
   }
 
+  // Undo/redo using the same mechanism
   #undo() {
     const cmd = this.#history.undo();
     if (!cmd) return;
-    const oldText = this.#store.text(this.#doc.id);
-    const newText = cmd.undo(oldText);
+    const newText = cmd.undo();
     this.#store.save(this.#doc.id, newText);
     this.#doc.text = newText;
     this.#lines = newText.split('\n');
-    this.#heights = new Array(this.#lines.length).fill(24);
     this.#store.dispatch('doc', { id: this.#doc.id, text: newText });
-    this.#render();
-    const off = cmd.off;
-    const { line, col } = this.#lineColFromOffset(off);
-    this.#setCursor(line, col);
+    this.#saveCursor();
+    this.#renderAll();
+    this.#restoreCursor();
   }
 
   #redo() {
     const cmd = this.#history.redo();
     if (!cmd) return;
-    const oldText = this.#store.text(this.#doc.id);
-    const newText = cmd.apply(oldText);
+    const newText = cmd.apply();
     this.#store.save(this.#doc.id, newText);
     this.#doc.text = newText;
     this.#lines = newText.split('\n');
-    this.#heights = new Array(this.#lines.length).fill(24);
     this.#store.dispatch('doc', { id: this.#doc.id, text: newText });
-    this.#render();
-    const off = cmd.off + cmd.text.length;
-    const { line, col } = this.#lineColFromOffset(off);
-    this.#setCursor(line, col);
+    this.#saveCursor();
+    this.#renderAll();
+    this.#restoreCursor();
+  }
+
+  // Keyboard shortcuts (Ctrl+Z/Y etc.)
+  #onKey(e) {
+    const key = e.key;
+    if (key === 'z' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      this.#undo();
+    } else if (key === 'y' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      this.#redo();
+    }
+    // All other keys are handled natively by contentEditable
   }
 }
 // ---------- View (preview pane) ----------
