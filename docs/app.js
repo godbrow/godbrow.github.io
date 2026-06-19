@@ -9,7 +9,6 @@ const load = async (url) => {
 };
 
 const build = (node) => {
-  // Support fragments (no wrapper element)
   if (node.fragment) {
     const frag = document.createDocumentFragment();
     node.children.forEach(child => frag.appendChild(build(child)));
@@ -25,34 +24,27 @@ const build = (node) => {
   return el;
 };
 
-// Escape HTML for preview safety
 const escape = (str) => str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 // ---------- Plugin system ----------
 const plug = {};
-
-const register = (plugin) => {
-  plug[plugin.mode] = plugin;
-};
+const register = (plugin) => { plug[plugin.mode] = plugin; };
 
 // ---- Built‑in: Text ----
 register({
-  mode: 'txt',
-  name: 'Text',
+  mode: 'txt', name: 'Text',
   start: () => ({}),
-  line: (line, ctx) => [{ kind: 'text', span: line }],
-  block: (ctx) => ({ kind: 'para' }),
+  line: (line) => [{ kind: 'text', span: line }],
+  block: () => ({ kind: 'para' }),
   render: (text) => `<pre>${escape(text)}</pre>`
 });
 
 // ---- Built‑in: Markdown (stateful) ----
 register({
-  mode: 'md',
-  name: 'Markdown',
-  start: () => ({ fence: false }),
+  mode: 'md', name: 'Markdown',
+  start: () => ({ fence: false, list: null }),
   line: (line, ctx) => {
     const tokens = [];
-    // Fenced code block toggle
     if (line.startsWith('```')) {
       ctx.fence = !ctx.fence;
       tokens.push({ kind: 'marker', span: '```' });
@@ -81,6 +73,15 @@ register({
         return tokens;
       }
     }
+    // Ordered list
+    if (/^\s*\d+\.\s/.test(line)) {
+      const m = line.match(/^(\s*\d+\.)\s(.*)/);
+      if (m) {
+        tokens.push({ kind: 'marker', span: m[1] + ' ' });
+        tokens.push({ kind: 'text', span: m[2] });
+        return tokens;
+      }
+    }
     // Blockquote
     if (/^>\s/.test(line)) {
       const m = line.match(/^>\s(.*)/);
@@ -90,39 +91,33 @@ register({
         return tokens;
       }
     }
-    // Default: all text
     tokens.push({ kind: 'text', span: line });
     return tokens;
   },
   block: (ctx) => {
     if (ctx.fence) return { kind: 'codeblock' };
-    // The block kind is determined during rendering based on the first token.
-    // This method is called after line() for the line, but we need to decide based on content.
-    // For simplicity, we return a generic kind and let the renderer inspect the line again.
-    // Better approach: cache per line in ctx during line(), but v1 uses a simple heuristic.
-    // We'll handle block classes in the editor by re‑inspecting the line string.
-    // Return 'para' – actual block class will be set by editor’s own logic.
     return { kind: 'para' };
   },
   render: (text) => {
     let html = escape(text);
-    // Code blocks (```)
     html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
-    // Headings
     html = html.replace(/^#{1,6}\s(.*)$/gm, (line) => {
       const level = line.match(/^(#{1,6})/)[1].length;
       const content = line.replace(/^#{1,6}\s/, '');
       return `<h${level}>${content}</h${level}>`;
     });
-    // Bold and italic
     html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
     html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
-    // Inline code
     html = html.replace(/`(.+?)`/g, '<code>$1</code>');
     // Unordered list
     html = html.replace(/^\s*[-*+]\s(.*)$/gm, '<li>$1</li>');
-    html = html.replace(/(<li>.*<\/li>)/s, '<ul>$1</ul>');
-    // Blockquote
+    html = html.replace(/((<li>.*?<\/li>\s*)+)/g, '<ul>$1</ul>');
+    // Ordered list
+    html = html.replace(/^\s*\d+\.\s(.*)$/gm, '<li>$1</li>');
+    html = html.replace(/((<li>.*?<\/li>\s*)+)/g, (match) => {
+      if (match.includes('<ul>')) return match;
+      return `<ol>${match}</ol>`;
+    });
     html = html.replace(/^>\s(.*)$/gm, '<blockquote>$1</blockquote>');
     return html;
   }
@@ -131,8 +126,7 @@ register({
 // ---- Built‑in: HTML, CSS, JS (simplified) ----
 ['html', 'css', 'js'].forEach(mode => {
   register({
-    mode,
-    name: mode.toUpperCase(),
+    mode, name: mode.toUpperCase(),
     start: () => ({}),
     line: (line) => [{ kind: 'text', span: line }],
     block: () => ({ kind: 'para' }),
@@ -144,79 +138,37 @@ register({
   });
 });
 
-// ---------- Undo / Redo ----------
+// ---------- Undo / Redo commands ----------
 class Insert {
-  // off = absolute character offset in the full string
-  constructor(off, text) {
-    this.off = off;
-    this.text = text;
-  }
-  apply(doc) {
-    return doc.slice(0, this.off) + this.text + doc.slice(this.off);
-  }
-  undo(doc) {
-    return doc.slice(0, this.off) + doc.slice(this.off + this.text.length);
-  }
+  constructor(off, text) { this.off = off; this.text = text; }
+  apply(doc) { return doc.slice(0, this.off) + this.text + doc.slice(this.off); }
+  undo(doc) { return doc.slice(0, this.off) + doc.slice(this.off + this.text.length); }
 }
-
 class Delete {
-  // off = absolute offset, text = the string that was deleted (needed for undo)
-  constructor(off, text) {
-    this.off = off;
-    this.text = text;
-  }
-  apply(doc) {
-    return doc.slice(0, this.off) + doc.slice(this.off + this.text.length);
-  }
-  undo(doc) {
-    return doc.slice(0, this.off) + this.text + doc.slice(this.off);
-  }
-}
-
-class Replace {
-  constructor(id, oldText, newText) {
-    this.id = id;
-    this.old = oldText;
-    this.new = newText;
-  }
-  apply(doc) { return this.new; }
-  undo(doc) { return this.old; }
+  constructor(off, text) { this.off = off; this.text = text; }
+  apply(doc) { return doc.slice(0, this.off) + doc.slice(this.off + this.text.length); }
+  undo(doc) { return doc.slice(0, this.off) + this.text + doc.slice(this.off); }
 }
 
 class History {
   constructor() { this.stack = []; this.idx = -1; }
-  push(cmd) {
-    this.stack = this.stack.slice(0, this.idx + 1);
-    this.stack.push(cmd);
-    this.idx++;
-  }
-  undo() {
-    if (this.idx < 0) return null;
-    return this.stack[this.idx--];
-  }
-  redo() {
-    if (this.idx >= this.stack.length - 1) return null;
-    return this.stack[++this.idx];
-  }
+  push(cmd) { this.stack = this.stack.slice(0, this.idx + 1); this.stack.push(cmd); this.idx++; }
+  undo() { if (this.idx < 0) return null; return this.stack[this.idx--]; }
+  redo() { if (this.idx >= this.stack.length - 1) return null; return this.stack[++this.idx]; }
 }
 
-// ---------- Store (central state, pub/sub) ----------
+// ---------- Store ----------
 class Store {
-  #state;
-  #subs;
-
+  #state; #subs;
   constructor() {
     this.#state = { tabs: [], active: null, docs: [], theme: 'light' };
     this.#subs = [];
   }
-
   get tabs()  { return this.#state.tabs; }
   get active() { return this.#state.active; }
   get docs()  { return this.#state.docs; }
   get theme() { return this.#state.theme; }
-
   subscribe(fn) { this.#subs.push(fn); }
-
   dispatch(action, data) {
     switch (action) {
       case 'tabs': this.#state.tabs = data; break;
@@ -234,13 +186,9 @@ class Store {
       }
     }
     this.#persist(action);
-    this.#notify(action);               // 👈 this is now correctly defined
+    this.#notify(action);
   }
-
-  #notify(action) {
-    this.#subs.forEach(fn => fn(action, this.#state));
-  }
-
+  #notify(action) { this.#subs.forEach(fn => fn(action, this.#state)); }
   #persist(action) {
     if (action === 'tabs' || action === 'active') {
       localStorage.setItem('tabs', JSON.stringify(this.#state.tabs));
@@ -251,11 +199,8 @@ class Store {
         this.#state.docs.map(d => ({ id: d.id, name: d.name, mode: d.mode, stamp: d.stamp }))
       ));
     }
-    if (action === 'theme') {
-      localStorage.setItem('theme', this.#state.theme);
-    }
+    if (action === 'theme') localStorage.setItem('theme', this.#state.theme);
   }
-
   load() {
     const tabs = JSON.parse(localStorage.getItem('tabs') || '[]');
     const active = localStorage.getItem('active') || null;
@@ -264,14 +209,8 @@ class Store {
     this.#state = { tabs, active, docs, theme };
     document.documentElement.classList.toggle('dark', theme === 'dark');
   }
-
-  // Convenience helpers
-  text(id) {
-    return localStorage.getItem(`doc:${id}`) || '';
-  }
-  save(id, text) {
-    localStorage.setItem(`doc:${id}`, text);
-  }
+  text(id) { return localStorage.getItem(`doc:${id}`) || ''; }
+  save(id, text) { localStorage.setItem(`doc:${id}`, text); }
 }
 
 // ---------- Head (toolbar + tabs) ----------
@@ -283,7 +222,6 @@ class Head {
     store.subscribe(() => this.render());
     this.bind();
   }
-
   render() {
     const { tabs, active } = this.store;
     this.el.querySelector('.tabs').innerHTML = tabs.map(id => {
@@ -292,44 +230,33 @@ class Head {
       return `<span class="tab${id === active ? ' active' : ''}" data-id="${id}">${name}</span>`;
     }).join('');
   }
-
   bind() {
-    // Delegate clicks on tabs
     this.el.querySelector('.tabs').addEventListener('click', (e) => {
       const tab = e.target.closest('.tab');
       if (!tab) return;
-      const id = tab.dataset.id;
-      if (id) this.store.dispatch('active', id);
+      this.store.dispatch('active', tab.dataset.id);
     });
-    // Action buttons
-    this.el.querySelector('.actions').addEventListener('click', (e) => {
-      const btn = e.target.closest('button');
-      if (!btn) return;
-      const act = btn.dataset.action;
-      if (act === 'new') this.newDoc();
-      else if (act === 'theme') this.toggleTheme();
-      // Other actions: export, import, etc. (placeholders)
-    });
-    // Render action buttons HTML
     this.el.querySelector('.actions').innerHTML = `
       <button data-action="new">New</button>
       <button data-action="theme">Theme</button>
     `;
+    this.el.querySelector('.actions').addEventListener('click', (e) => {
+      const btn = e.target.closest('button');
+      if (!btn) return;
+      if (btn.dataset.action === 'new') this.newDoc();
+      else if (btn.dataset.action === 'theme') this.toggleTheme();
+    });
   }
-
   newDoc() {
     const id = 'doc_' + Date.now();
     const doc = { id, name: 'untitled', mode: 'md', stamp: Date.now() };
-    const docs = [...this.store.docs, doc];
-    this.store.dispatch('docs', docs);
+    this.store.dispatch('docs', [...this.store.docs, doc]);
     this.store.save(id, '');
     this.store.dispatch('tabs', [...this.store.tabs, id]);
     this.store.dispatch('active', id);
   }
-
   toggleTheme() {
-    const next = this.store.theme === 'dark' ? 'light' : 'dark';
-    this.store.dispatch('theme', next);
+    this.store.dispatch('theme', this.store.theme === 'dark' ? 'light' : 'dark');
   }
 }
 
@@ -342,23 +269,19 @@ class List {
     store.subscribe(() => this.render());
     this.bind();
   }
-
   render() {
-    const docs = this.store.docs;
-    this.el.innerHTML = docs.map(d => `
+    this.el.innerHTML = this.store.docs.map(d => `
       <div class="file" data-id="${d.id}">
         <span>${d.name}</span>
         <span class="mode">${d.mode}</span>
       </div>
     `).join('');
   }
-
   bind() {
     this.el.addEventListener('click', (e) => {
       const file = e.target.closest('.file');
       if (!file) return;
       const id = file.dataset.id;
-      // If not open, add to tabs
       if (!this.store.tabs.includes(id)) {
         this.store.dispatch('tabs', [...this.store.tabs, id]);
       }
@@ -367,14 +290,12 @@ class List {
   }
 }
 
-// ---------- Edit (contenteditable pre, native cursor) ----------
-// ---------- Edit (contenteditable pre, native cursor) ----------
-// ---------- Edit (hidden textarea + virtualised, exact click) ----------
+// ---------- Edit (virtualised editor) ----------
 class Edit {
   #store; #doc; #lines; #heights; #scroll; #gutter; #textarea;
   #history; #parser; #cursor; #pool; #sentinel; #caret;
   #focused = false; #composing = false; #composeStartText = '';
-  #cursors = new Map();   // per‑document cursor memory
+  #cursors = new Map();
 
   constructor(store, main) {
     this.#store = store;
@@ -382,26 +303,25 @@ class Edit {
     this.#scroll = main.querySelector('.content');
     this.#textarea = this.#makeTextarea();
     this.#scroll.appendChild(this.#textarea);
-    this.#pool = [];
-    this.#heights = [];
-    this.#lines = [];
+    this.#pool = []; this.#heights = []; this.#lines = [];
     this.#cursor = { line: 0, col: 0 };
     this.#history = new History();
     this.#sentinel = document.createElement('div');
     this.#sentinel.className = 'sentinel';
     this.#scroll.appendChild(this.#sentinel);
 
-    // Blinking caret element
     this.#caret = document.createElement('span');
     this.#caret.className = 'caret';
-    this.#caret.style.cssText = 'position:absolute;width:2px;height:var(--line-height);background:var(--text);display:none;pointer-events:none;z-index:2;';
+    this.#caret.style.cssText = 'position:absolute;width:2px;height:24px;background:var(--text);display:none;pointer-events:none;z-index:2;';
     this.#scroll.appendChild(this.#caret);
 
     this.#scroll.addEventListener('scroll', () => this.#render());
     this.#scroll.addEventListener('mousedown', (e) => this.#onMouseDown(e));
     this.#textarea.addEventListener('keydown', (e) => this.#onKey(e));
-    this.#textarea.addEventListener('focus', () => { this.#focused = true; this.#showCaret(); });
-    this.#textarea.addEventListener('blur', () => { this.#focused = false; this.#hideCaret(); });
+
+    // Use scroll container for focus tracking (not the invisible textarea)
+    this.#scroll.addEventListener('focusin', () => { this.#focused = true; this.#showCaret(); });
+    this.#scroll.addEventListener('focusout', () => { this.#focused = false; this.#hideCaret(); });
 
     this.#textarea.addEventListener('compositionstart', () => {
       this.#composing = true;
@@ -414,10 +334,8 @@ class Edit {
       const oldLine = this.#composeStartText;
       if (composed !== oldLine) {
         const startOff = this.#offsetFromLineCol(line, 0);
-        const del = new Delete(startOff, oldLine);
-        this.#applyCommand(del);
-        const ins = new Insert(startOff, composed);
-        this.#applyCommand(ins);
+        this.#applyCommand(new Delete(startOff, oldLine));
+        this.#applyCommand(new Insert(startOff, composed));
         this.#setCursor(line, composed.length);
       }
     });
@@ -429,7 +347,7 @@ class Edit {
 
   #makeTextarea() {
     const ta = document.createElement('textarea');
-    ta.style.cssText = 'position:absolute;opacity:0;pointer-events:none;width:1px;height:1px;left:0;top:0;z-index:1;';
+    ta.style.cssText = 'position:absolute;opacity:0;width:1px;height:1px;left:0;top:0;z-index:1;';
     return ta;
   }
 
@@ -447,18 +365,10 @@ class Edit {
       plugin: plug[doc.mode] || plug.txt,
       ctx: (plug[doc.mode] || plug.txt).start()
     };
-
-    // Restore previous cursor
     const saved = this.#cursors.get(id);
-    if (saved) {
-      this.#cursor = { line: saved.line, col: saved.col };
-    } else {
-      this.#cursor = { line: 0, col: 0 };
-    }
-    if (this.#cursor.line >= this.#lines.length)
-      this.#cursor.line = Math.max(0, this.#lines.length - 1);
-    if (this.#cursor.col > (this.#lines[this.#cursor.line] || '').length)
-      this.#cursor.col = (this.#lines[this.#cursor.line] || '').length;
+    this.#cursor = saved ? { line: saved.line, col: saved.col } : { line: 0, col: 0 };
+    if (this.#cursor.line >= this.#lines.length) this.#cursor.line = Math.max(0, this.#lines.length - 1);
+    if (this.#cursor.col > (this.#lines[this.#cursor.line] || '').length) this.#cursor.col = (this.#lines[this.#cursor.line] || '').length;
 
     this.#clearPool();
     this.#render();
@@ -466,369 +376,248 @@ class Edit {
     this.#textarea.focus();
   }
 
-  #clearPool() {
-    this.#pool.forEach(el => el.remove());
-    this.#pool = [];
-  }
+  #clearPool() { this.#pool.forEach(el => el.remove()); this.#pool = []; }
 
   #render() {
-    const scrollTop = this.#scroll.scrollTop;
-    const viewHeight = this.#scroll.clientHeight;
+    const st = this.#scroll.scrollTop, vh = this.#scroll.clientHeight;
     let start = 0, end = 0, acc = 0;
     for (let i = 0; i < this.#lines.length; i++) {
-      const h = this.#heights[i] || 24;
-      if (acc + h > scrollTop) { start = i; break; }
-      acc += h;
+      if (acc + (this.#heights[i] || 24) > st) { start = i; break; }
+      acc += this.#heights[i] || 24;
     }
     acc = 0;
     for (let i = start; i < this.#lines.length; i++) {
-      const h = this.#heights[i] || 24;
-      acc += h;
-      if (acc > viewHeight + 200) { end = i; break; }
+      acc += this.#heights[i] || 24;
+      if (acc > vh + 200) { end = i; break; }
       if (i === this.#lines.length - 1) end = i;
     }
-
     this.#clearPool();
+    const gf = document.createDocumentFragment();
+    for (let i = start; i <= end; i++) {
+      const n = document.createElement('div');
+      n.textContent = i + 1;
+      n.style.height = (this.#heights[i] || 24) + 'px';
+      n.style.lineHeight = (this.#heights[i] || 24) + 'px';
+      gf.appendChild(n);
+    }
+    this.#gutter.innerHTML = ''; this.#gutter.appendChild(gf);
+
     const frag = document.createDocumentFragment();
-    const gutterFrag = document.createDocumentFragment();
-
-    // Gutter numbers
     for (let i = start; i <= end; i++) {
-      const lineNum = document.createElement('div');
-      lineNum.textContent = i + 1;
-      lineNum.style.height = `${this.#heights[i] || 24}px`;
-      lineNum.style.lineHeight = `${this.#heights[i] || 24}px`;
-      gutterFrag.appendChild(lineNum);
-    }
-    this.#gutter.innerHTML = '';
-    this.#gutter.appendChild(gutterFrag);
-
-    // Lines (no duplicate line numbers)
-    for (let i = start; i <= end; i++) {
-      const lineEl = document.createElement('div');
-      lineEl.className = 'line';
-      lineEl.style.top = `${this.#offset(i)}px`;
-      lineEl.dataset.line = i;
-
-      const blockKind = this.#detectBlockKind(i);
-      if (blockKind) lineEl.classList.add(blockKind);
-
-      const textSpan = document.createElement('span');
-      textSpan.className = 'text';
-      const tokens = this.#tokenizeLine(i);
-      tokens.forEach(tok => {
-        const span = document.createElement('span');
-        span.className = tok.kind;
-        span.textContent = tok.span;
-        textSpan.appendChild(span);
+      const le = document.createElement('div');
+      le.className = 'line';
+      le.style.top = this.#offset(i) + 'px';
+      le.dataset.line = i;
+      const bk = this.#detectBlockKind(i);
+      if (bk) le.classList.add(bk);
+      const ts = document.createElement('span');
+      ts.className = 'text';
+      this.#tokenizeLine(i).forEach(tok => {
+        const sp = document.createElement('span');
+        sp.className = tok.kind;
+        sp.textContent = tok.span;
+        ts.appendChild(sp);
       });
-
-      lineEl.appendChild(textSpan);   // only the text span
-      frag.appendChild(lineEl);
-      this.#pool.push(lineEl);
+      le.appendChild(ts);
+      frag.appendChild(le);
+      this.#pool.push(le);
     }
-
     this.#scroll.appendChild(frag);
-    this.#sentinel.style.height = `${this.#offset(this.#lines.length)}px`;
-
+    this.#sentinel.style.height = this.#offset(this.#lines.length) + 'px';
     if (this.#focused) this.#showCaret();
   }
 
-  #offset(untilLine) {
-    let o = 0;
-    for (let i = 0; i < untilLine; i++) o += this.#heights[i] || 24;
-    return o;
-  }
-
-  #offsetFromLineCol(line, col) {
-    let off = 0;
-    for (let i = 0; i < line; i++) off += this.#lines[i].length + 1;
-    off += col;
-    return off;
-  }
-
+  #offset(until) { let o = 0; for (let i = 0; i < until; i++) o += this.#heights[i] || 24; return o; }
+  #offsetFromLineCol(l, c) { let o = 0; for (let i = 0; i < l; i++) o += this.#lines[i].length + 1; return o + c; }
   #lineColFromOffset(off) {
-    let l = 0, c = 0, acc = 0;
+    let l = 0, c = 0, a = 0;
     while (l < this.#lines.length) {
-      const lineLen = this.#lines[l].length;
-      if (acc + lineLen >= off) { c = off - acc; break; }
-      acc += lineLen + 1;
-      l++;
+      const len = this.#lines[l].length;
+      if (a + len >= off) { c = off - a; break; }
+      a += len + 1; l++;
     }
     if (l >= this.#lines.length) { l = this.#lines.length - 1; c = this.#lines[l].length; }
     return { line: l, col: Math.min(c, this.#lines[l].length) };
   }
-
-  #tokenizeLine(lineIndex) {
-    const plugin = this.#parser.plugin;
-    const ctx = plugin.start();
-    for (let i = 0; i < lineIndex; i++) plugin.line(this.#lines[i], ctx);
-    return plugin.line(this.#lines[lineIndex], ctx);
+  #tokenizeLine(i) {
+    const p = this.#parser.plugin, ctx = p.start();
+    for (let j = 0; j < i; j++) p.line(this.#lines[j], ctx);
+    return p.line(this.#lines[i], ctx);
   }
-
-  #detectBlockKind(lineIndex) {
-    const line = this.#lines[lineIndex] || '';
+  #detectBlockKind(i) {
+    const line = this.#lines[i] || '';
     if (/^```/.test(line)) return 'codeblock';
     if (/^#{1,6}\s/.test(line)) return 'heading';
     if (/^\s*[-*+]\s/.test(line)) return 'list-block';
+    if (/^\s*\d+\.\s/.test(line)) return 'list-block';
     if (/^>\s/.test(line)) return 'quote';
     return 'para';
   }
 
-  // ---------- Precise click handling using browser API ----------
+  // ---------- Click ----------
   #onMouseDown(e) {
-    const lineEl = e.target.closest('.line');
-    if (!lineEl) return;
-    const line = parseInt(lineEl.dataset.line, 10);
-
-    // Use the browser's own text position detection (works for any font/zoom)
-    const caretPos = document.caretPositionFromPoint(e.clientX, e.clientY);
-    if (caretPos) {
-      let node = caretPos.offsetNode;
-      let offset = caretPos.offset;
-      // Walk up to find the .text span
-      const textSpan = lineEl.querySelector('.text');
-      if (textSpan) {
-        // Ensure we are inside the .text span (click might be on a token span)
-        while (node && node !== textSpan) {
-          node = node.parentNode;
-        }
-        if (node === textSpan) {
-          // Now count characters from the start of textSpan to the offset
-          const col = this.#columnFromNode(textSpan, caretPos.offsetNode, offset);
-          this.#setCursor(line, Math.min(col, (this.#lines[line] || '').length));
-          this.#textarea.focus();
-          return;
-        }
+    const le = e.target.closest('.line');
+    if (!le) return;
+    const line = parseInt(le.dataset.line, 10);
+    const ts = le.querySelector('.text');
+    if (!ts) { this.#setCursor(line, 0); this.#focus(); return; }
+    const cp = document.caretPositionFromPoint(e.clientX, e.clientY);
+    if (cp) {
+      let node = cp.offsetNode;
+      while (node && node !== ts) node = node.parentNode;
+      if (node === ts) {
+        let col = 0;
+        const w = document.createTreeWalker(ts, NodeFilter.SHOW_TEXT);
+        let n = w.nextNode();
+        while (n && n !== cp.offsetNode) { col += n.textContent.length; n = w.nextNode(); }
+        if (n === cp.offsetNode) col += cp.offset;
+        this.#setCursor(line, Math.min(col, (this.#lines[line] || '').length));
+        this.#focus();
+        return;
       }
     }
+    // Fallback
+    const rect = ts.getBoundingClientRect();
+    const cw = 9.6;
+    const col = Math.max(0, Math.round((e.clientX - rect.left) / cw));
+    this.#setCursor(line, Math.min(col, (this.#lines[line] || '').length));
+    this.#focus();
+  }
 
-    // Fallback (should rarely happen): estimate column from x coordinate
-    const textSpan = lineEl.querySelector('.text');
-    if (textSpan) {
-      const rect = textSpan.getBoundingClientRect();
-      const charWidth = 9.6;
-      const col = Math.max(0, Math.round((e.clientX - rect.left) / charWidth));
-      this.#setCursor(line, Math.min(col, (this.#lines[line] || '').length));
-    } else {
-      this.#setCursor(line, 0);
-    }
+  #focus() {
+    this.#focused = true;
     this.#textarea.focus();
+    this.#showCaret();
   }
 
-  // Calculate column from a DOM node inside the .text container
-  #columnFromNode(textSpan, targetNode, offsetInNode) {
-    let col = 0;
-    const walker = document.createTreeWalker(textSpan, NodeFilter.SHOW_TEXT);
-    let node = walker.nextNode();
-    while (node && node !== targetNode) {
-      col += node.textContent.length;
-      node = walker.nextNode();
-    }
-    if (node === targetNode) {
-      col += offsetInNode;
-    }
-    return col;
-  }
-
-  // ---------- Cursor rendering ----------
+  // ---------- Cursor ----------
   #setCursor(line, col) {
     this.#cursor = { line, col };
-    const lineText = this.#lines[line] || '';
-    this.#textarea.value = lineText;
+    this.#textarea.value = this.#lines[line] || '';
     this.#textarea.setSelectionRange(col, col);
-    const targetY = this.#offset(line);
-    this.#scroll.scrollTop = targetY - this.#scroll.clientHeight / 2;
     if (this.#doc) this.#cursors.set(this.#doc.id, { line, col });
     if (this.#focused) this.#showCaret();
   }
-
   #showCaret() {
     if (!this.#doc) return;
     const { line, col } = this.#cursor;
-    const lineEl = this.#pool.find(el => parseInt(el.dataset.line) === line);
-    if (!lineEl) { this.#caret.style.display = 'none'; return; }
-    const textSpan = lineEl.querySelector('.text');
-    if (!textSpan) { this.#caret.style.display = 'none'; return; }
-
-    const baseLeft = textSpan.offsetLeft;
-    const x = this.#getColumnPixel(textSpan, col);
-    const lineTop = parseFloat(lineEl.style.top);
-    const lineHeight = this.#heights[line] || 24;
-
-    this.#caret.style.display = 'block';
-    this.#caret.style.left = `${baseLeft + x}px`;
-    this.#caret.style.top = `${lineTop}px`;
-    this.#caret.style.height = `${lineHeight}px`;
-  }
-
-  #hideCaret() {
-    this.#caret.style.display = 'none';
-  }
-
-  // Returns the pixel offset inside textSpan for a given column (0‑based)
-  #getColumnPixel(textSpan, col) {
-    let cur = 0;
-    let x = 0;
-    for (const child of textSpan.children) {
-      const len = child.textContent.length;
+    const le = this.#pool.find(el => parseInt(el.dataset.line) === line);
+    if (!le) { this.#caret.style.display = 'none'; return; }
+    const ts = le.querySelector('.text');
+    if (!ts) { this.#caret.style.display = 'none'; return; }
+    const bl = ts.offsetLeft;
+    let x = 0, cur = 0;
+    for (const ch of ts.children) {
+      const len = ch.textContent.length;
       if (cur + len > col) {
-        const offset = col - cur;
-        const range = document.createRange();
-        const textNode = child.firstChild;
-        if (textNode) {
-          range.setStart(textNode, 0);
-          range.setEnd(textNode, offset);
-        }
-        x += range.getBoundingClientRect().width;
+        const r = document.createRange();
+        const tn = ch.firstChild;
+        if (tn) { r.setStart(tn, 0); r.setEnd(tn, col - cur); }
+        x += r.getBoundingClientRect().width;
         break;
-      } else {
-        x += child.getBoundingClientRect().width;
-        cur += len;
-      }
+      } else { x += ch.getBoundingClientRect().width; cur += len; }
     }
-    return x;
+    this.#caret.style.display = 'block';
+    this.#caret.style.left = (bl + x) + 'px';
+    this.#caret.style.top = le.style.top;
+    this.#caret.style.height = (this.#heights[line] || 24) + 'px';
   }
+  #hideCaret() { this.#caret.style.display = 'none'; }
 
   // ---------- Keyboard ----------
   #onKey(e) {
     if (this.#composing) return;
     const { line, col } = this.#cursor;
-    const key = e.key;
-
-    if (key === 'ArrowUp') {
-      e.preventDefault();
-      if (line > 0) this.#setCursor(line - 1, Math.min(col, (this.#lines[line-1] || '').length));
-      return;
-    }
-    if (key === 'ArrowDown') {
-      e.preventDefault();
-      if (line < this.#lines.length - 1) this.#setCursor(line + 1, Math.min(col, (this.#lines[line+1] || '').length));
-      return;
-    }
-    if (key === 'ArrowLeft') {
-      e.preventDefault();
-      if (col > 0) this.#setCursor(line, col - 1);
-      else if (line > 0) this.#setCursor(line - 1, (this.#lines[line - 1] || '').length);
-      return;
-    }
-    if (key === 'ArrowRight') {
-      e.preventDefault();
-      if (col < (this.#lines[line] || '').length) this.#setCursor(line, col + 1);
-      else if (line < this.#lines.length - 1) this.#setCursor(line + 1, 0);
-      return;
-    }
-    if (key === 'Home') { e.preventDefault(); this.#setCursor(line, 0); return; }
-    if (key === 'End') { e.preventDefault(); this.#setCursor(line, (this.#lines[line] || '').length); return; }
-
-    if (key === 'Backspace') {
+    const k = e.key;
+    if (k === 'ArrowUp') { e.preventDefault(); if (line > 0) this.#setCursor(line - 1, Math.min(col, (this.#lines[line-1] || '').length)); }
+    else if (k === 'ArrowDown') { e.preventDefault(); if (line < this.#lines.length - 1) this.#setCursor(line + 1, Math.min(col, (this.#lines[line+1] || '').length)); }
+    else if (k === 'ArrowLeft') { e.preventDefault(); if (col > 0) this.#setCursor(line, col - 1); else if (line > 0) this.#setCursor(line - 1, (this.#lines[line-1] || '').length); }
+    else if (k === 'ArrowRight') { e.preventDefault(); if (col < (this.#lines[line] || '').length) this.#setCursor(line, col + 1); else if (line < this.#lines.length - 1) this.#setCursor(line + 1, 0); }
+    else if (k === 'Home') { e.preventDefault(); this.#setCursor(line, 0); }
+    else if (k === 'End') { e.preventDefault(); this.#setCursor(line, (this.#lines[line] || '').length); }
+    else if (k === 'Backspace') {
       e.preventDefault();
       if (col > 0) {
         const off = this.#offsetFromLineCol(line, col - 1);
-        const deleted = this.#doc.text.charAt(off);
-        const cmd = new Delete(off, deleted);
-        this.#applyCommand(cmd);
+        this.#applyCommand(new Delete(off, this.#doc.text.charAt(off)));
         this.#setCursor(line, col - 1);
       } else if (line > 0) {
-        const prevLineLen = this.#lines[line - 1].length;
-        const off = this.#offsetFromLineCol(line - 1, prevLineLen);
-        const cmd = new Delete(off, '\n');
-        this.#applyCommand(cmd);
-        this.#setCursor(line - 1, prevLineLen);
+        const prevLen = this.#lines[line - 1].length;
+        this.#applyCommand(new Delete(this.#offsetFromLineCol(line - 1, prevLen), '\n'));
+        this.#setCursor(line - 1, prevLen);
       }
-      return;
-    }
-    if (key === 'Delete') {
+    } else if (k === 'Delete') {
       e.preventDefault();
       if (col < (this.#lines[line] || '').length) {
         const off = this.#offsetFromLineCol(line, col);
-        const deleted = this.#doc.text.charAt(off);
-        const cmd = new Delete(off, deleted);
-        this.#applyCommand(cmd);
+        this.#applyCommand(new Delete(off, this.#doc.text.charAt(off)));
         this.#setCursor(line, col);
       } else if (line < this.#lines.length - 1) {
-        const off = this.#offsetFromLineCol(line, this.#lines[line].length);
-        const cmd = new Delete(off, '\n');
-        this.#applyCommand(cmd);
+        this.#applyCommand(new Delete(this.#offsetFromLineCol(line, this.#lines[line].length), '\n'));
         this.#setCursor(line, col);
       }
-      return;
-    }
-    if (key === 'Enter') {
+    } else if (k === 'Enter') {
       e.preventDefault();
-      const off = this.#offsetFromLineCol(line, col);
-      const cmd = new Insert(off, '\n');
-      this.#applyCommand(cmd);
+      this.#applyCommand(new Insert(this.#offsetFromLineCol(line, col), '\n'));
       this.#setCursor(line + 1, 0);
-      return;
-    }
-    if (key === 'z' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); this.#undo(); return; }
-    if (key === 'y' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); this.#redo(); return; }
-
-    if (key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    } else if (k === 'z' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); this.#undo(); }
+    else if (k === 'y' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); this.#redo(); }
+    else if (k.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
       e.preventDefault();
-      const off = this.#offsetFromLineCol(line, col);
-      const cmd = new Insert(off, key);
-      this.#applyCommand(cmd);
+      this.#applyCommand(new Insert(this.#offsetFromLineCol(line, col), k));
       this.#setCursor(line, col + 1);
     }
   }
 
   #applyCommand(cmd) {
-    const oldText = this.#store.text(this.#doc.id);
-    const newText = cmd.apply(oldText);
-    this.#store.save(this.#doc.id, newText);
-    this.#doc.text = newText;
-    this.#lines = newText.split('\n');
+    const old = this.#store.text(this.#doc.id);
+    const nxt = cmd.apply(old);
+    this.#store.save(this.#doc.id, nxt);
+    this.#doc.text = nxt;
+    this.#lines = nxt.split('\n');
     this.#heights = new Array(this.#lines.length).fill(24);
     this.#history.push(cmd);
-    this.#store.dispatch('doc', { id: this.#doc.id, text: newText });
+    this.#store.dispatch('doc', { id: this.#doc.id, text: nxt });
     this.#render();
   }
-
   #undo() {
     const cmd = this.#history.undo();
     if (!cmd) return;
-    const oldText = this.#store.text(this.#doc.id);
-    const newText = cmd.undo(oldText);
-    this.#store.save(this.#doc.id, newText);
-    this.#doc.text = newText;
-    this.#lines = newText.split('\n');
+    const nxt = cmd.undo(this.#store.text(this.#doc.id));
+    this.#store.save(this.#doc.id, nxt);
+    this.#doc.text = nxt;
+    this.#lines = nxt.split('\n');
     this.#heights = new Array(this.#lines.length).fill(24);
-    this.#store.dispatch('doc', { id: this.#doc.id, text: newText });
+    this.#store.dispatch('doc', { id: this.#doc.id, text: nxt });
     this.#render();
-    const off = cmd.off;
-    const { line, col } = this.#lineColFromOffset(off);
+    const { line, col } = this.#lineColFromOffset(cmd.off);
     this.#setCursor(line, col);
   }
-
   #redo() {
     const cmd = this.#history.redo();
     if (!cmd) return;
-    const oldText = this.#store.text(this.#doc.id);
-    const newText = cmd.apply(oldText);
-    this.#store.save(this.#doc.id, newText);
-    this.#doc.text = newText;
-    this.#lines = newText.split('\n');
+    const nxt = cmd.apply(this.#store.text(this.#doc.id));
+    this.#store.save(this.#doc.id, nxt);
+    this.#doc.text = nxt;
+    this.#lines = nxt.split('\n');
     this.#heights = new Array(this.#lines.length).fill(24);
-    this.#store.dispatch('doc', { id: this.#doc.id, text: newText });
+    this.#store.dispatch('doc', { id: this.#doc.id, text: nxt });
     this.#render();
-    const off = cmd.off + cmd.text.length;
-    const { line, col } = this.#lineColFromOffset(off);
+    const { line, col } = this.#lineColFromOffset(cmd.off + cmd.text.length);
     this.#setCursor(line, col);
   }
 }
-// ---------- View (preview pane) ----------
+
+// ---------- View (preview) ----------
 class View {
   constructor(store, iframe) {
     this.store = store;
     this.iframe = iframe;
-store.subscribe((action) => {
-  if (action === 'active' || action === 'docs' || action === 'doc') this.update();
-});
+    store.subscribe((action) => {
+      if (action === 'active' || action === 'docs' || action === 'doc') this.update();
+    });
     this.update();
   }
-
   update() {
     const id = this.store.active;
     if (!id) return;
@@ -836,12 +625,11 @@ store.subscribe((action) => {
     if (!doc) return;
     const text = this.store.text(id);
     const plugin = plug[doc.mode] || plug.txt;
-    const html = plugin.render(text);
-    this.iframe.srcdoc = html;
+    this.iframe.srcdoc = plugin.render(text);
   }
 }
 
-// ---------- Foot (status bar) ----------
+// ---------- Foot ----------
 class Foot {
   constructor(store, el) {
     this.store = store;
@@ -849,36 +637,23 @@ class Foot {
     store.subscribe(() => this.render());
     this.render();
   }
-
   render() {
     const mode = this.store.active
       ? (this.store.docs.find(d => d.id === this.store.active)?.mode || 'txt')
       : '-';
-    this.el.textContent = `v1 Editor | Mode: ${mode} | Lines: ?`; // line/col will be added later
+    this.el.textContent = `v1 Editor | Mode: ${mode}`;
   }
 }
 
 // ---------- Boot ----------
 (async () => {
-  // Register service worker
   if ('serviceWorker' in navigator) {
-    try {
-      await navigator.serviceWorker.register('/worker.js');
-    } catch (err) {
-      console.warn('Service worker registration failed:', err);
-    }
+    try { await navigator.serviceWorker.register('/worker.js'); } catch {}
   }
-
-  // Load SDUI and build DOM
   const ui = await load('/ui.json');
-  const frag = build(ui);
-  document.body.append(frag);
-
-  // Initialise store
+  document.body.append(build(ui));
   const store = new Store();
   store.load();
-
-  // Instantiate components using structural selectors
   new Head(store, document.querySelector('body > header'));
   new List(store, document.querySelector('body > aside:first-of-type'));
   new Edit(store, document.querySelector('body > main'));
