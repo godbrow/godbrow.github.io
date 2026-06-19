@@ -146,31 +146,30 @@ register({
 
 // ---------- Undo / Redo ----------
 class Insert {
-  constructor(line, col, text) { this.line = line; this.col = col; this.text = text; }
+  // off = absolute character offset in the full string
+  constructor(off, text) {
+    this.off = off;
+    this.text = text;
+  }
   apply(doc) {
-    const lines = doc.split('\n');
-    lines[this.line] = lines[this.line].slice(0, this.col) + this.text + lines[this.line].slice(this.col);
-    return lines.join('\n');
+    return doc.slice(0, this.off) + this.text + doc.slice(this.off);
   }
   undo(doc) {
-    const lines = doc.split('\n');
-    const len = this.text.length;
-    lines[this.line] = lines[this.line].slice(0, this.col) + lines[this.line].slice(this.col + len);
-    return lines.join('\n');
+    return doc.slice(0, this.off) + doc.slice(this.off + this.text.length);
   }
 }
 
 class Delete {
-  constructor(line, col, text) { this.line = line; this.col = col; this.text = text; }
+  // off = absolute offset, text = the string that was deleted (needed for undo)
+  constructor(off, text) {
+    this.off = off;
+    this.text = text;
+  }
   apply(doc) {
-    const lines = doc.split('\n');
-    lines[this.line] = lines[this.line].slice(0, this.col) + lines[this.line].slice(this.col + this.text.length);
-    return lines.join('\n');
+    return doc.slice(0, this.off) + doc.slice(this.off + this.text.length);
   }
   undo(doc) {
-    const lines = doc.split('\n');
-    lines[this.line] = lines[this.line].slice(0, this.col) + this.text + lines[this.line].slice(this.col);
-    return lines.join('\n');
+    return doc.slice(0, this.off) + this.text + doc.slice(this.off);
   }
 }
 
@@ -355,21 +354,10 @@ class List {
   }
 }
 
-// ---------- Edit (virtualised editor) ----------
-// ---------- Edit (virtualised editor, fixed input) ----------
+// ---------- Edit (virtualised editor, fixed input & line ops) ----------
 class Edit {
-  #store;
-  #doc;
-  #lines;
-  #heights;
-  #scroll;
-  #gutter;
-  #textarea;
-  #history;
-  #parser;
-  #cursor;
-  #pool;
-  #sentinel;
+  #store; #doc; #lines; #heights; #scroll; #gutter; #textarea;
+  #history; #parser; #cursor; #pool; #sentinel;
   #composing = false;
   #composeStartText = '';
 
@@ -384,7 +372,6 @@ class Edit {
     this.#lines = [];
     this.#cursor = { line: 0, col: 0 };
     this.#history = new History();
-
     this.#sentinel = document.createElement('div');
     this.#sentinel.className = 'sentinel';
     this.#scroll.appendChild(this.#sentinel);
@@ -392,7 +379,7 @@ class Edit {
     this.#scroll.addEventListener('scroll', () => this.#render());
     this.#scroll.addEventListener('mousedown', (e) => this.#onMouseDown(e));
     this.#textarea.addEventListener('keydown', (e) => this.#onKey(e));
-    // IME composition
+
     this.#textarea.addEventListener('compositionstart', () => {
       this.#composing = true;
       this.#composeStartText = this.#lines[this.#cursor.line] || '';
@@ -402,15 +389,19 @@ class Edit {
       const composed = e.data || '';
       const { line, col } = this.#cursor;
       const oldLine = this.#composeStartText;
-      // Build a command that transforms oldLine into the composed text
-      // Approach: delete the whole line, then insert the new content at col
-      // For simplicity, we replace the entire line with the composed text.
       if (composed !== oldLine) {
-        // Delete the entire old line, then insert the new one
-        const delCmd = new Delete(line, 0, oldLine);
-        this.#applyCommand(delCmd);
-        const insCmd = new Insert(line, 0, composed);
-        this.#applyCommand(insCmd);
+        // Replace the whole line with the composed text
+        const off = this.#offsetFromLineCol(line, 0);
+        const delCmd = new Delete(off, oldLine + '\n'); // remove old line + newline
+        // Actually we need to be careful: the line might not have a trailing newline.
+        // Simpler: we replace the whole line content by deleting oldLine and inserting composed.
+        // We'll handle it as a delete of oldLine.length chars at line start, then insert.
+        // For a more robust approach, we'll compute offset of line start, delete oldLine, insert composed.
+        const startOff = this.#offsetFromLineCol(line, 0);
+        const del = new Delete(startOff, oldLine);
+        this.#applyCommand(del);
+        const ins = new Insert(startOff, composed);
+        this.#applyCommand(ins);
         this.#setCursor(line, composed.length);
       }
     });
@@ -443,6 +434,9 @@ class Edit {
     this.#cursor = { line: 0, col: 0 };
     this.#clearPool();
     this.#render();
+    // Auto‑focus and place cursor at the start
+    this.#setCursor(0, 0);
+    this.#textarea.focus();
   }
 
   #clearPool() {
@@ -456,20 +450,14 @@ class Edit {
     let start = 0, end = 0, acc = 0;
     for (let i = 0; i < this.#lines.length; i++) {
       const h = this.#heights[i] || 24;
-      if (acc + h > scrollTop) {
-        start = i;
-        break;
-      }
+      if (acc + h > scrollTop) { start = i; break; }
       acc += h;
     }
     acc = 0;
     for (let i = start; i < this.#lines.length; i++) {
       const h = this.#heights[i] || 24;
       acc += h;
-      if (acc > viewHeight + 200) {
-        end = i;
-        break;
-      }
+      if (acc > viewHeight + 200) { end = i; break; }
       if (i === this.#lines.length - 1) end = i;
     }
 
@@ -526,6 +514,34 @@ class Edit {
     return o;
   }
 
+  // Convert line/col to absolute character offset
+  #offsetFromLineCol(line, col) {
+    let off = 0;
+    for (let i = 0; i < line; i++) off += this.#lines[i].length + 1; // +1 for newline
+    off += col;
+    return off;
+  }
+
+  // Convert absolute offset to line/col
+  #lineColFromOffset(off) {
+    let l = 0, c = 0;
+    let acc = 0;
+    while (l < this.#lines.length) {
+      const lineLen = this.#lines[l].length;
+      if (acc + lineLen >= off) {
+        c = off - acc;
+        break;
+      }
+      acc += lineLen + 1; // +1 for newline
+      l++;
+    }
+    if (l >= this.#lines.length) {
+      l = this.#lines.length - 1;
+      c = this.#lines[l].length;
+    }
+    return { line: l, col: Math.min(c, this.#lines[l].length) };
+  }
+
   #tokenizeLine(lineIndex) {
     const plugin = this.#parser.plugin;
     const ctx = plugin.start();
@@ -562,6 +578,7 @@ class Edit {
     this.#textarea.setSelectionRange(col, col);
     const targetY = this.#offset(line);
     this.#scroll.scrollTop = targetY - this.#scroll.clientHeight / 2;
+    this.#textarea.focus(); // ensure focus is kept
   }
 
   #onKey(e) {
@@ -570,7 +587,7 @@ class Edit {
     const { line, col } = this.#cursor;
     const key = e.key;
 
-    // Navigation keys
+    // Navigation
     if (key === 'ArrowUp') {
       e.preventDefault();
       if (line > 0) this.#setCursor(line - 1, Math.min(col, (this.#lines[line-1] || '').length));
@@ -583,61 +600,66 @@ class Edit {
     }
     if (key === 'ArrowLeft') {
       e.preventDefault();
-      this.#setCursor(line, Math.max(0, col - 1));
+      if (col > 0) this.#setCursor(line, col - 1);
+      else if (line > 0) this.#setCursor(line - 1, this.#lines[line - 1].length);
       return;
     }
     if (key === 'ArrowRight') {
       e.preventDefault();
-      this.#setCursor(line, Math.min((this.#lines[line] || '').length, col + 1));
+      if (col < (this.#lines[line] || '').length) this.#setCursor(line, col + 1);
+      else if (line < this.#lines.length - 1) this.#setCursor(line + 1, 0);
       return;
     }
-    if (key === 'Home') {
-      e.preventDefault();
-      this.#setCursor(line, 0);
-      return;
-    }
-    if (key === 'End') {
-      e.preventDefault();
-      this.#setCursor(line, (this.#lines[line] || '').length);
-      return;
-    }
+    if (key === 'Home') { e.preventDefault(); this.#setCursor(line, 0); return; }
+    if (key === 'End') { e.preventDefault(); this.#setCursor(line, (this.#lines[line] || '').length); return; }
+
     if (key === 'Backspace') {
       e.preventDefault();
       if (col > 0) {
-        const deleted = this.#lines[line].charAt(col - 1);
-        const cmd = new Delete(line, col - 1, deleted);
+        const off = this.#offsetFromLineCol(line, col - 1);
+        const deleted = this.#doc.text.charAt(off);
+        const cmd = new Delete(off, deleted);
         this.#applyCommand(cmd);
         this.#setCursor(line, col - 1);
       } else if (line > 0) {
-        const prevLen = this.#lines[line - 1].length;
-        const cmd = new Delete(line - 1, prevLen, '\n');
+        // Merge with previous line: delete the newline character
+        const prevLineLen = this.#lines[line - 1].length;
+        const off = this.#offsetFromLineCol(line - 1, prevLineLen); // position of newline
+        const cmd = new Delete(off, '\n');
         this.#applyCommand(cmd);
-        this.#setCursor(line - 1, prevLen);
+        this.#setCursor(line - 1, prevLineLen);
       }
       return;
     }
+
     if (key === 'Delete') {
       e.preventDefault();
       if (col < (this.#lines[line] || '').length) {
-        const deleted = this.#lines[line].charAt(col);
-        const cmd = new Delete(line, col, deleted);
+        const off = this.#offsetFromLineCol(line, col);
+        const deleted = this.#doc.text.charAt(off);
+        const cmd = new Delete(off, deleted);
         this.#applyCommand(cmd);
         this.#setCursor(line, col);
       } else if (line < this.#lines.length - 1) {
-        const cmd = new Delete(line, (this.#lines[line] || '').length, '\n');
+        // Merge next line: delete the newline at end of current line
+        const off = this.#offsetFromLineCol(line, this.#lines[line].length);
+        const cmd = new Delete(off, '\n');
         this.#applyCommand(cmd);
         this.#setCursor(line, col);
       }
       return;
     }
+
     if (key === 'Enter') {
       e.preventDefault();
-      const cmd = new Insert(line, col, '\n');
+      const off = this.#offsetFromLineCol(line, col);
+      const cmd = new Insert(off, '\n');
       this.#applyCommand(cmd);
       this.#setCursor(line + 1, 0);
       return;
     }
-    // Undo/Redo
+
+    // Undo / Redo
     if (key === 'z' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
       this.#undo();
@@ -649,10 +671,11 @@ class Edit {
       return;
     }
 
-    // Printable characters (length === 1 and no modifier)
+    // Printable character
     if (key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
       e.preventDefault();
-      const cmd = new Insert(line, col, key);
+      const off = this.#offsetFromLineCol(line, col);
+      const cmd = new Insert(off, key);
       this.#applyCommand(cmd);
       this.#setCursor(line, col + 1);
     }
@@ -679,7 +702,9 @@ class Edit {
     this.#lines = newText.split('\n');
     this.#heights = new Array(this.#lines.length).fill(24);
     this.#render();
-    this.#setCursor(cmd.line, Math.min(this.#cursor.col, (this.#lines[cmd.line] || '').length));
+    const off = cmd.off; // approximate: put cursor at the edit position
+    const { line, col } = this.#lineColFromOffset(off);
+    this.#setCursor(line, col);
   }
 
   #redo() {
@@ -692,7 +717,9 @@ class Edit {
     this.#lines = newText.split('\n');
     this.#heights = new Array(this.#lines.length).fill(24);
     this.#render();
-    this.#setCursor(cmd.line, Math.min(this.#cursor.col, (this.#lines[cmd.line] || '').length));
+    const off = cmd.off + cmd.text.length; // after inserted text
+    const { line, col } = this.#lineColFromOffset(off);
+    this.#setCursor(line, col);
   }
 }
 // ---------- View (preview pane) ----------
