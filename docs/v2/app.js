@@ -1,5 +1,6 @@
+
 /* =========================================================
-   SDUI Block Editor Kernel v7 (STABLE FIXED CORE)
+   SDUI Block Editor Kernel v8 (STABLE + SAFE INIT)
 ========================================================= */
 
 /* =========================================================
@@ -13,16 +14,18 @@ const DocumentModel = {
 };
 
 let globalBlockId = 0;
+
 function createBlock(type = "paragraph", text = "") {
   return { id: globalBlockId++, type, text };
 }
 
 /* =========================================================
-   SIMPLE PARSER
+   PARSER
 ========================================================= */
 
 function parseToBlocks(text = "") {
   const lines = text.split("\n");
+
   const blocks = [];
   let buffer = [];
   let id = 0;
@@ -60,18 +63,17 @@ function parseToBlocks(text = "") {
 }
 
 /* =========================================================
-   DOM + STATE
+   DOM STATE
 ========================================================= */
 
 let editorPanel = null;
 let previewPanel = null;
 
 const BlockDOMCache = new Map();
-
 let activeBlockId = null;
 
 /* =========================================================
-   SCHEDULERS (CRITICAL FIX)
+   SAFE RENDER QUEUES
 ========================================================= */
 
 let editorQueued = false;
@@ -98,7 +100,7 @@ function queuePreviewRender() {
 }
 
 /* =========================================================
-   CURSOR SAFETY
+   CURSOR STATE (SAFE)
 ========================================================= */
 
 const CursorState = {
@@ -113,7 +115,9 @@ function saveCursor(el, block) {
 
 function restoreCursor() {
   requestAnimationFrame(() => {
-    const el = editorPanel?.querySelector(
+    if (CursorState.blockId == null) return;
+
+    const el = editorPanel.querySelector(
       `[data-id="${CursorState.blockId}"]`
     );
 
@@ -128,10 +132,58 @@ function restoreCursor() {
 }
 
 /* =========================================================
-   BLOCK ELEMENT FACTORY (IMPORTANT)
+   SDUI LOADER (FIXED)
+========================================================= */
+
+async function loadUI() {
+
+  // If no ui.json exists, fallback to static detection
+  try {
+    const res = await fetch("./ui.json");
+
+    if (!res.ok) throw new Error("No UI schema");
+
+    const schema = await res.json();
+
+    renderNode(schema, document.body);
+
+  } catch {
+    // fallback: assume HTML already exists
+  }
+}
+
+function renderNode(node, parent) {
+
+  switch (node.type) {
+
+    case "page":
+      node.children?.forEach(c => renderNode(c, parent));
+      break;
+
+    case "main":
+      const main = document.querySelector("main") || parent;
+      node.children?.forEach(c => renderNode(c, main));
+      break;
+
+    case "section":
+      const el = document.createElement("section");
+
+      // 🔥 CRITICAL FIX: preserve role
+      if (node.role) {
+        el.setAttribute("role", node.role);
+      }
+
+      parent.appendChild(el);
+      break;
+  }
+}
+
+/* =========================================================
+   BLOCK ELEMENT CREATION
 ========================================================= */
 
 function createBlockElement(block) {
+
   const el = document.createElement("div");
 
   el.contentEditable = true;
@@ -146,6 +198,7 @@ function createBlockElement(block) {
   });
 
   el.addEventListener("input", () => {
+
     block.text = el.innerText;
 
     saveCursor(el, block);
@@ -166,13 +219,14 @@ function createBlockElement(block) {
 ========================================================= */
 
 function renderEditor() {
+
   const blocks = DocumentModel.getBlocks();
   const container = editorPanel;
 
   const activeIds = new Set();
 
-  for (let i = 0; i < blocks.length; i++) {
-    const block = blocks[i];
+  for (const block of blocks) {
+
     activeIds.add(block.id);
 
     let el = BlockDOMCache.get(block.id);
@@ -182,7 +236,7 @@ function renderEditor() {
       BlockDOMCache.set(block.id, el);
     }
 
-    // NEVER overwrite active typing block
+    // IMPORTANT: do NOT overwrite active block
     if (block.id !== activeBlockId) {
       el.innerText = block.text;
     }
@@ -192,7 +246,6 @@ function renderEditor() {
     }
   }
 
-  // cleanup removed blocks
   for (const [id, el] of BlockDOMCache.entries()) {
     if (!activeIds.has(id)) {
       el.remove();
@@ -202,10 +255,11 @@ function renderEditor() {
 }
 
 /* =========================================================
-   BLOCK OPERATIONS
+   BLOCK OPS
 ========================================================= */
 
 function splitBlock(block, pos) {
+
   const before = block.text.slice(0, pos);
   const after = block.text.slice(pos);
 
@@ -222,6 +276,7 @@ function splitBlock(block, pos) {
 }
 
 function mergeWithPrevious(block) {
+
   const arr = DocumentModel.getBlocks();
   const idx = arr.indexOf(block);
 
@@ -236,7 +291,7 @@ function mergeWithPrevious(block) {
 }
 
 /* =========================================================
-   KEY HANDLER (FIXED ENTER/DELETE)
+   KEY HANDLER (STABLE)
 ========================================================= */
 
 function handleKeydown(e, el, block) {
@@ -251,8 +306,10 @@ function handleKeydown(e, el, block) {
     queueEditorRender();
     queuePreviewRender();
 
-    restoreCursor();
+    CursorState.blockId = newBlock.id;
+    CursorState.offset = 0;
 
+    restoreCursor();
     return;
   }
 
@@ -275,10 +332,11 @@ function handleKeydown(e, el, block) {
 }
 
 /* =========================================================
-   MARKDOWN RENDER
+   PREVIEW RENDER (SAFE)
 ========================================================= */
 
 function renderMarkdown(text) {
+
   if (!text) return "";
 
   return text
@@ -293,16 +351,16 @@ function renderMarkdown(text) {
     .replace(/`([^`]+)`/g, "<code>$1</code>");
 }
 
-/* =========================================================
-   PREVIEW RENDER
-========================================================= */
-
 function renderPreview() {
+
+  if (!previewPanel) return;
+
   const blocks = DocumentModel.getBlocks();
 
   previewPanel.innerHTML = "";
 
   for (const block of blocks) {
+
     const el = document.createElement("div");
     el.dataset.blockId = block.id;
 
@@ -313,12 +371,18 @@ function renderPreview() {
 }
 
 /* =========================================================
-   INIT
+   INIT (FIXED ORDER)
 ========================================================= */
 
 function init() {
+
   editorPanel = document.querySelector('[role="editor-panel"]');
   previewPanel = document.querySelector('[role="preview-panel"]');
+
+  if (!editorPanel || !previewPanel) {
+    console.error("Missing editor or preview panel in DOM");
+    return;
+  }
 
   const blocks = parseToBlocks("");
 
@@ -328,4 +392,8 @@ function init() {
   renderPreview();
 }
 
-init();
+/* =========================================================
+   BOOT
+========================================================= */
+
+loadUI().then(init);
