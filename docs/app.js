@@ -134,6 +134,49 @@ function extractBlocks(text) {
   return { text, store };
 }
 
+function buildList(block) {
+  const lines = block.split("\n");
+
+  let html = "";
+  let stack = [{ level: 0, html: "<ul>" }];
+
+  const getLevel = (line) => line.match(/^\s*/)[0].length;
+
+  for (let line of lines) {
+    const isOrdered = /^\s*\d+\./.test(line);
+    const isUnordered = /^\s*[-*]/.test(line);
+
+    if (!isOrdered && !isUnordered) continue;
+
+    const level = getLevel(line);
+    const content = line.replace(/^\s*([-*]|\d+\.)\s*/, "");
+
+    const tag = isOrdered ? "ol" : "ul";
+
+    // adjust nesting
+    let current = stack[stack.length - 1];
+
+    if (level > current.level) {
+      stack.push({ level, html: `<${tag}><li>${content}` });
+    } else {
+      while (stack.length && level < stack[stack.length - 1].level) {
+        const closed = stack.pop();
+        stack[stack.length - 1].html += closed.html + `</${tag}>`;
+      }
+      stack[stack.length - 1].html += `<li>${content}`;
+    }
+  }
+
+  while (stack.length > 1) {
+    const closed = stack.pop();
+    stack[stack.length - 1].html += closed.html + "</ul>";
+  }
+
+  html = stack[0].html + "</ul>";
+
+  return html;
+}
+
 function renderInline(text) {
   return text
     .replace(/`([^`]+)`/g, "<code>$1</code>")
@@ -157,6 +200,7 @@ function renderMarkdown(src) {
 
   // 3. structural markdown (still core-owned)
   text = text
+    .replace(/^---$/gm, "<hr>")
     .replace(/^###### (.*)$/gm, "<h6>$1</h6>")
     .replace(/^##### (.*)$/gm, "<h5>$1</h5>")
     .replace(/^#### (.*)$/gm, "<h4>$1</h4>")
@@ -165,6 +209,15 @@ function renderMarkdown(src) {
     .replace(/^# (.*)$/gm, "<h1>$1</h1>")
     .replace(/^> (.*)$/gm, "<blockquote>$1</blockquote>");
 
+  // task list
+  text = text.replace(/^[-*] \[( |x)\] (.*)$/gm, (_, checked, content) => {
+    return `
+      <li class="task">
+        <input type="checkbox" ${checked === "x" ? "checked" : ""} disabled />
+        <span>${content}</span>
+      </li>
+    `;
+  });
   // 4. inline phase
   text = renderInline(text);
 
@@ -172,35 +225,43 @@ function renderMarkdown(src) {
   text = text.replace(/@@BLOCK_(\d+)@@/g, (_, i) => store[i]);
 
   // 6. lists (kept core for now)
-  text = text.replace(
-    /(?:^[-*] .*(\n|$))+?/gm,
-    (match) => {
-      const items = match
-        .trim()
-        .split("\n")
-        .map(l => l.replace(/^[-*] /, ""))
-        .map(i => `<li>${i}</li>`)
-        .join("");
+  text = text.replace(/(?:^(?:\s*[-*]|\s*\d+\.).*(\n|$))+?/gm, (block) => buildList(block.trim()));
+  
+  // 7. table
+  text = text.replace(/((?:\|.*\|\n)+)/g, (block) => {
+    const rows = block.trim().split("\n");
 
-      return `<ul>${items}</ul>`;
-    }
-  );
+    const htmlRows = rows
+      .filter(r => r.includes("|"))
+      .map((row, i) => {
+        const cells = row
+          .split("|")
+          .map(c => c.trim())
+          .filter(Boolean);
 
-  text = text.replace(
-    /(?:^\d+\. .*(\n|$))+?/gm,
-    (match) => {
-      const items = match
-        .trim()
-        .split("\n")
-        .map(l => l.replace(/^\d+\. /, ""))
-        .map(i => `<li>${i}</li>`)
-        .join("");
+        const tag = i === 1 ? "th" : "td";
 
-      return `<ol>${items}</ol>`;
-    }
-  );
+        const htmlCells = cells
+          .map(c => `<${tag}>${c}</${tag}>`)
+          .join("");
 
-  // 7. final newline pass
+        return `<tr>${htmlCells}</tr>`;
+      })
+      .join("");
+
+    return `<table>${htmlRows}</table>`;
+  });
+  // 8. blockquote
+  text = text.replace(/(?:^> .*(\n|$))+?/gm, (block) => {
+    const content = block
+      .split("\n")
+      .map(l => l.replace(/^> ?/, ""))
+      .join("<br>");
+
+    return `<blockquote>${content}</blockquote>`;
+  });
+
+  // 9. final newline pass
   text = text.replace(/\n/g, "<br>");
 
   return text;
