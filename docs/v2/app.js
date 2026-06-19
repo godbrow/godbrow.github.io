@@ -1,9 +1,5 @@
-
 /* =========================================================
-   SDUI Block Editor Kernel v6 (STABLE)
-   - Fixes typing corruption
-   - Safe rendering pipeline
-   - Plugin system preserved
+   SDUI Block Editor Kernel v7 (STABLE FIXED CORE)
 ========================================================= */
 
 /* =========================================================
@@ -12,55 +8,32 @@
 
 const DocumentModel = {
   blocks: [],
-
-  setBlocks(blocks) {
-    this.blocks = blocks;
-  },
-
-  getBlocks() {
-    return this.blocks;
-  }
+  setBlocks(b) { this.blocks = b; },
+  getBlocks() { return this.blocks; }
 };
 
-/* =========================================================
-   BLOCK FACTORY
-========================================================= */
-
 let globalBlockId = 0;
-
 function createBlock(type = "paragraph", text = "") {
-  return {
-    id: globalBlockId++,
-    type,
-    text
-  };
+  return { id: globalBlockId++, type, text };
 }
 
 /* =========================================================
-   PARSER
+   SIMPLE PARSER
 ========================================================= */
 
 function parseToBlocks(text = "") {
   const lines = text.split("\n");
-
   const blocks = [];
   let buffer = [];
   let id = 0;
 
   const flush = (type = "paragraph") => {
     if (!buffer.length) return;
-
-    blocks.push({
-      id: id++,
-      type,
-      text: buffer.join("\n")
-    });
-
+    blocks.push({ id: id++, type, text: buffer.join("\n") });
     buffer = [];
   };
 
   for (const line of lines) {
-
     if (line.startsWith("# ")) {
       flush();
       blocks.push({ id: id++, type: "h1", text: line.slice(2) });
@@ -83,54 +56,49 @@ function parseToBlocks(text = "") {
   }
 
   flush();
-
   return blocks;
 }
 
 /* =========================================================
-   VIRTUAL RANGE
+   DOM + STATE
 ========================================================= */
 
-const VirtualState = {
-  start: 0,
-  end: 0,
-  buffer: 6
-};
+let editorPanel = null;
+let previewPanel = null;
 
-function estimateHeight(block) {
-  return 28 + block.text.split("\n").length * 18;
+const BlockDOMCache = new Map();
+
+let activeBlockId = null;
+
+/* =========================================================
+   SCHEDULERS (CRITICAL FIX)
+========================================================= */
+
+let editorQueued = false;
+let previewQueued = false;
+
+function queueEditorRender() {
+  if (editorQueued) return;
+
+  editorQueued = true;
+  requestAnimationFrame(() => {
+    editorQueued = false;
+    renderEditor();
+  });
 }
 
-function computeVisibleRange(blocks, scrollTop, viewportHeight) {
+function queuePreviewRender() {
+  if (previewQueued) return;
 
-  let y = 0;
-  let start = 0;
-
-  for (let i = 0; i < blocks.length; i++) {
-    const h = estimateHeight(blocks[i]);
-
-    if (y + h > scrollTop) {
-      start = Math.max(0, i - VirtualState.buffer);
-      break;
-    }
-
-    y += h;
-  }
-
-  let end = start;
-  let h = 0;
-
-  while (end < blocks.length && h < viewportHeight) {
-    h += estimateHeight(blocks[end]);
-    end++;
-  }
-
-  VirtualState.start = start;
-  VirtualState.end = end + VirtualState.buffer;
+  previewQueued = true;
+  requestAnimationFrame(() => {
+    previewQueued = false;
+    renderPreview();
+  });
 }
 
 /* =========================================================
-   CURSOR STATE (SAFE VERSION)
+   CURSOR SAFETY
 ========================================================= */
 
 const CursorState = {
@@ -143,13 +111,9 @@ function saveCursor(el, block) {
   CursorState.offset = el.selectionStart ?? el.innerText.length;
 }
 
-function restoreCursor(editorPanel) {
-
+function restoreCursor() {
   requestAnimationFrame(() => {
-
-    if (CursorState.blockId == null) return;
-
-    const el = editorPanel.querySelector(
+    const el = editorPanel?.querySelector(
       `[data-id="${CursorState.blockId}"]`
     );
 
@@ -158,225 +122,77 @@ function restoreCursor(editorPanel) {
     el.focus();
 
     try {
-      el.setSelectionRange?.(
-        CursorState.offset,
-        CursorState.offset
-      );
+      el.setSelectionRange?.(CursorState.offset, CursorState.offset);
     } catch {}
   });
 }
 
 /* =========================================================
-   ACTIVE EDITING GUARD (CRITICAL FIX)
+   BLOCK ELEMENT FACTORY (IMPORTANT)
 ========================================================= */
 
-let activeBlockId = null;
+function createBlockElement(block) {
+  const el = document.createElement("div");
 
-/* =========================================================
-   RENDER DEBOUNCE (CRITICAL FIX)
-========================================================= */
+  el.contentEditable = true;
+  el.dataset.id = block.id;
 
-let renderQueued = false;
-
-function queueRender() {
-  if (renderQueued) return;
-
-  renderQueued = true;
-
-  requestAnimationFrame(() => {
-    renderQueued = false;
-    scheduleRender();
+  el.addEventListener("focus", () => {
+    activeBlockId = block.id;
   });
+
+  el.addEventListener("blur", () => {
+    activeBlockId = null;
+  });
+
+  el.addEventListener("input", () => {
+    block.text = el.innerText;
+
+    saveCursor(el, block);
+
+    queuePreviewRender();
+    queueEditorRender();
+  });
+
+  el.addEventListener("keydown", (e) => {
+    handleKeydown(e, el, block);
+  });
+
+  return el;
 }
 
 /* =========================================================
-   PLUGIN SYSTEM
+   EDITOR RENDER (SAFE DOM REUSE)
 ========================================================= */
 
-const PluginRegistry = {
-  plugins: new Map(),
-
-  register(plugin) {
-    this.plugins.set(plugin.type, plugin);
-  },
-
-  get(type) {
-    return this.plugins.get(type);
-  }
-};
-
-class PluginInstance {
-  constructor(plugin, block, el) {
-    this.plugin = plugin;
-    this.block = block;
-    this.el = el;
-    this.abortController = new AbortController();
-  }
-
-  ctx() {
-    return { signal: this.abortController.signal };
-  }
-
-  mount() {
-    this.plugin.mount?.(this.block, this.el, this.ctx());
-  }
-
-  update(block) {
-    this.block = block;
-    this.plugin.update?.(this.block, this.el, this.ctx());
-  }
-
-  destroy() {
-    this.abortController.abort();
-    this.plugin.destroy?.(this.block, this.el);
-  }
-}
-
-const PluginInstances = new Map();
-
-/* =========================================================
-   DOM CACHE (VIRTUALIZATION STABILITY)
-========================================================= */
-
-const BlockDOMCache = new Map();
-
-/* =========================================================
-   DOM REFERENCES
-========================================================= */
-
-let editorPanel = null;
-let previewPanel = null;
-
-/* =========================================================
-   SDUI LOADER
-========================================================= */
-
-async function loadUI() {
-  const res = await fetch("./ui.json");
-  const schema = await res.json();
-
-  renderNode(schema, document.body);
-}
-
-function renderNode(node, parent) {
-
-  switch (node.type) {
-
-    case "page":
-      node.children?.forEach(c => renderNode(c, parent));
-      break;
-
-    case "main":
-      const main = document.querySelector("main");
-      node.children?.forEach(c => renderNode(c, main));
-      break;
-
-    case "section":
-      const el = document.createElement("section");
-      if (node.role) el.setAttribute("role", node.role);
-      parent.appendChild(el);
-      break;
-  }
-}
-
-/* =========================================================
-   PLUGIN RUNTIME
-========================================================= */
-
-function runPlugin(block, el) {
-
-  const plugin = PluginRegistry.get(block.type);
-  if (!plugin) return;
-
-  const existing = PluginInstances.get(block.id);
-
-  if (existing) {
-    existing.update(block);
-    return;
-  }
-
-  const instance = new PluginInstance(plugin, block, el);
-
-  PluginInstances.set(block.id, instance);
-
-  instance.mount();
-}
-
-function cleanupPlugins(activeIds) {
-
-  for (const [id, inst] of PluginInstances.entries()) {
-    if (!activeIds.has(id)) {
-      inst.destroy();
-      PluginInstances.delete(id);
-    }
-  }
-}
-
-/* =========================================================
-   EDITOR (VIRTUAL + SAFE DOM REUSE)
-========================================================= */
-
-function renderEditorVirtual() {
-
+function renderEditor() {
   const blocks = DocumentModel.getBlocks();
   const container = editorPanel;
 
   const activeIds = new Set();
 
-  for (
-    let i = VirtualState.start;
-    i < VirtualState.end;
-    i++
-  ) {
+  for (let i = 0; i < blocks.length; i++) {
     const block = blocks[i];
-    if (!block) continue;
-
     activeIds.add(block.id);
 
     let el = BlockDOMCache.get(block.id);
 
     if (!el) {
-      el = document.createElement("div");
-
-      el.contentEditable = true;
-      el.dataset.id = block.id;
-
-      el.addEventListener("focus", () => {
-        activeBlockId = block.id;
-      });
-
-      el.addEventListener("blur", () => {
-        activeBlockId = null;
-      });
-
-      el.addEventListener("input", () => {
-
-        saveCursor(el, block);
-
-        block.text = el.innerText;
-
-        syncPreviewBlock(block);
-
-        queueRender();
-
-        restoreCursor(editorPanel);
-      });
-
-      el.addEventListener("keydown", (e) => {
-        handleBlockEditing(e, el, block);
-      });
-
+      el = createBlockElement(block);
       BlockDOMCache.set(block.id, el);
     }
 
-    // IMPORTANT: do NOT overwrite active typing block
+    // NEVER overwrite active typing block
     if (block.id !== activeBlockId) {
       el.innerText = block.text;
     }
 
-    container.appendChild(el);
+    if (el.parentNode !== container) {
+      container.appendChild(el);
+    }
   }
 
+  // cleanup removed blocks
   for (const [id, el] of BlockDOMCache.entries()) {
     if (!activeIds.has(id)) {
       el.remove();
@@ -386,154 +202,83 @@ function renderEditorVirtual() {
 }
 
 /* =========================================================
-   BLOCK EDITING
+   BLOCK OPERATIONS
 ========================================================= */
 
-function splitBlock(block, cursorPos) {
-
-  const before = block.text.slice(0, cursorPos);
-  const after = block.text.slice(cursorPos);
+function splitBlock(block, pos) {
+  const before = block.text.slice(0, pos);
+  const after = block.text.slice(pos);
 
   block.text = before;
 
   const newBlock = createBlock("paragraph", after);
 
-  const blocks = DocumentModel.getBlocks();
-  const index = blocks.indexOf(block);
+  const arr = DocumentModel.getBlocks();
+  const idx = arr.indexOf(block);
 
-  blocks.splice(index + 1, 0, newBlock);
+  arr.splice(idx + 1, 0, newBlock);
 
   return newBlock;
 }
 
 function mergeWithPrevious(block) {
+  const arr = DocumentModel.getBlocks();
+  const idx = arr.indexOf(block);
 
-  const blocks = DocumentModel.getBlocks();
-  const index = blocks.indexOf(block);
+  if (idx === 0) return null;
 
-  if (index === 0) return null;
-
-  const prev = blocks[index - 1];
-
+  const prev = arr[idx - 1];
   prev.text += block.text;
 
-  blocks.splice(index, 1);
+  arr.splice(idx, 1);
 
   return prev;
 }
 
-function handleBlockEditing(e, el, block) {
+/* =========================================================
+   KEY HANDLER (FIXED ENTER/DELETE)
+========================================================= */
 
-  const cursorPos = el.innerText.length;
+function handleKeydown(e, el, block) {
+
+  const pos = el.selectionStart ?? el.innerText.length;
 
   if (e.key === "Enter") {
     e.preventDefault();
 
-    const newBlock = splitBlock(block, cursorPos);
+    const newBlock = splitBlock(block, pos);
 
-    scheduleRender();
-    renderPreview();
+    queueEditorRender();
+    queuePreviewRender();
 
-    restoreCursor(editorPanel);
+    restoreCursor();
+
+    return;
   }
 
-  if (e.key === "Backspace" && cursorPos === 0) {
+  if (e.key === "Backspace" && pos === 0) {
     e.preventDefault();
 
     const prev = mergeWithPrevious(block);
 
-    scheduleRender();
-    renderPreview();
+    queueEditorRender();
+    queuePreviewRender();
 
-    if (prev) restoreCursor(editorPanel);
+    if (prev) {
+      CursorState.blockId = prev.id;
+      CursorState.offset = prev.text.length;
+      restoreCursor();
+    }
+
+    return;
   }
 }
 
 /* =========================================================
-   PREVIEW SYSTEM
-========================================================= */
-
-function renderBlock(block) {
-
-  const plugin = PluginRegistry.get(block.type);
-
-  if (plugin?.render) {
-    return plugin.render(block);
-  }
-
-  return `<p>${block.text}</p>`;
-}
-
-function renderPreview() {
-
-  if (!previewPanel) {
-    previewPanel = document.querySelector('[role="preview-panel"]');
-  }
-
-  const blocks = DocumentModel.getBlocks();
-
-  previewPanel.innerHTML = "";
-
-  const activeIds = new Set();
-
-  for (const block of blocks) {
-
-    activeIds.add(block.id);
-
-    const wrapper = document.createElement("div");
-
-    wrapper.dataset.blockId = block.id;
-
-    wrapper.innerHTML = renderBlock(block);
-
-    previewPanel.appendChild(wrapper);
-
-    runPlugin(block, wrapper);
-  }
-
-  cleanupPlugins(activeIds);
-}
-
-function syncPreviewBlock(block) {
-
-  const el = previewPanel.querySelector(
-    `[data-block-id="${block.id}"]`
-  );
-
-  if (!el) return;
-
-  const inst = PluginInstances.get(block.id);
-
-  if (inst) {
-    inst.update(block);
-  }
-}
-
-/* =========================================================
-   PIPELINE
-========================================================= */
-
-function scheduleRender() {
-
-  const blocks = DocumentModel.getBlocks();
-
-  computeVisibleRange(
-    blocks,
-    editorPanel.scrollTop,
-    editorPanel.clientHeight
-  );
-
-  requestAnimationFrame(() => {
-    renderEditorVirtual();
-  });
-}
-
-/* =========================================================
-   MARKDOWN PLUGIN (FIXED ROOT CAUSE)
+   MARKDOWN RENDER
 ========================================================= */
 
 function renderMarkdown(text) {
-
   if (!text) return "";
 
   return text
@@ -548,38 +293,38 @@ function renderMarkdown(text) {
     .replace(/`([^`]+)`/g, "<code>$1</code>");
 }
 
-PluginRegistry.register({
-  type: "paragraph",
-  render(block) {
-    return renderMarkdown(block.text);
+/* =========================================================
+   PREVIEW RENDER
+========================================================= */
+
+function renderPreview() {
+  const blocks = DocumentModel.getBlocks();
+
+  previewPanel.innerHTML = "";
+
+  for (const block of blocks) {
+    const el = document.createElement("div");
+    el.dataset.blockId = block.id;
+
+    el.innerHTML = renderMarkdown(block.text);
+
+    previewPanel.appendChild(el);
   }
-});
+}
 
 /* =========================================================
    INIT
 ========================================================= */
 
-function initEditor() {
-
+function init() {
   editorPanel = document.querySelector('[role="editor-panel"]');
   previewPanel = document.querySelector('[role="preview-panel"]');
-
-  editorPanel.addEventListener("scroll", () => {
-    scheduleRender();
-  });
-}
-
-async function init() {
-
-  await loadUI();
-
-  initEditor();
 
   const blocks = parseToBlocks("");
 
   DocumentModel.setBlocks(blocks);
 
-  scheduleRender();
+  renderEditor();
   renderPreview();
 }
 
