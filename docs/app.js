@@ -1,12 +1,11 @@
 /* =========================================================
-   Markdown Lab — app.js
-   Core UX + rendering orchestration layer
-   ES2025+ clean modular style (no frameworks)
+   Vanilla Markdown Lab — app.js (CLEAN CORE)
+   Unified architecture before async rendering layer
 ========================================================= */
 
-/* -----------------------------
-   Utilities
------------------------------ */
+/* =========================================================
+   UTILITIES
+========================================================= */
 
 const debounce = (fn, wait = 60) => {
   let t;
@@ -16,73 +15,56 @@ const debounce = (fn, wait = 60) => {
   };
 };
 
-const escapeHtml = (str) =>
+const escapeHtml = (str = "") =>
   str
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");
 
-/* -----------------------------
-   State
------------------------------ */
-
-const state = {
-  storageKey: "vanilla_md_doc_v1",
-  themeKey: "vanilla_md_theme_v1"
-};
-
-/* -----------------------------
-   DOM refs (initialized later)
------------------------------ */
+/* =========================================================
+   DOM
+========================================================= */
 
 let editor;
 let preview;
 
-/* -----------------------------
-   Autosave system
------------------------------ */
+/* =========================================================
+   STORAGE
+========================================================= */
 
 const storage = {
-  save(content) {
-    localStorage.setItem(state.storageKey, content);
+  key: "vml_doc_v1",
+
+  save(value) {
+    localStorage.setItem(this.key, value);
   },
 
   load() {
-    return localStorage.getItem(state.storageKey) || "";
+    return localStorage.getItem(this.key) || "";
   }
 };
 
-/* -----------------------------
-   Scroll Sync System
------------------------------ */
+/* =========================================================
+   EVENT BUS (lightweight core signal system)
+========================================================= */
 
-function attachScrollSync(editorEl, previewEl) {
-  let ticking = false;
+const EventBus = {
+  emit(name, data) {
+    document.dispatchEvent(new CustomEvent(name, { detail: data }));
+  },
 
-  editorEl.addEventListener("scroll", () => {
-    if (ticking) return;
+  on(name, handler) {
+    document.addEventListener(name, (e) => handler(e.detail));
+  }
+};
 
-    ticking = true;
+/* =========================================================
+   REGISTRIES
+========================================================= */
 
-    requestAnimationFrame(() => {
-      const ratio =
-        editorEl.scrollTop /
-        Math.max(1, editorEl.scrollHeight - editorEl.clientHeight);
-
-      previewEl.scrollTop =
-        ratio *
-        Math.max(1, previewEl.scrollHeight - previewEl.clientHeight);
-
-      ticking = false;
-    });
-  });
-}
-
-/* -----------------------------
-   Render Pipeline (core markdown)
-   NOTE: intentionally minimal here
-   plugins will extend later
------------------------------ */
+/* -------------------------
+   BLOCK REGISTRY
+------------------------- */
 
 const BlockRegistry = {
   blocks: new Map(),
@@ -91,22 +73,20 @@ const BlockRegistry = {
     this.blocks.set(type, handler);
   },
 
-  has(type) {
-    return this.blocks.has(type);
-  },
-
   get(type) {
     return this.blocks.get(type);
   }
 };
-const InlineRegistry = {
 
+/* -------------------------
+   INLINE REGISTRY
+------------------------- */
+
+const InlineRegistry = {
   rules: [],
 
   register(name, pattern, renderer, priority = 100) {
-    this.rules.push({name, pattern, renderer, priority});
-
-    // smaller number runs first
+    this.rules.push({ name, pattern, renderer, priority });
     this.rules.sort((a, b) => a.priority - b.priority);
   },
 
@@ -118,278 +98,265 @@ const InlineRegistry = {
   }
 };
 
+/* =========================================================
+   PLUGIN RUNTIME
+========================================================= */
+
+const PluginRuntime = {
+  plugins: new Map(),
+  active: new Set(),
+
+  register(plugin) {
+    this.plugins.set(plugin.name, {
+      ...plugin,
+      enabled: false
+    });
+  },
+
+  enable(name, ctx) {
+    const p = this.plugins.get(name);
+    if (!p || p.enabled) return;
+
+    p.enabled = true;
+    this.active.add(name);
+
+    p.init?.(ctx);
+    p.onEnable?.(ctx);
+  },
+
+  disable(name, ctx) {
+    const p = this.plugins.get(name);
+    if (!p || !p.enabled) return;
+
+    p.enabled = false;
+    this.active.delete(name);
+
+    p.onDisable?.(ctx);
+  }
+};
+
+/* =========================================================
+   PLUGIN CONTEXT
+========================================================= */
+
+function createPluginContext() {
+  return {
+    editor,
+    preview,
+    BlockRegistry,
+    InlineRegistry,
+    EventBus
+  };
+}
+
+/* =========================================================
+   MARKDOWN ENGINE
+========================================================= */
+
+/* -------------------------
+   BLOCK EXTRACTION
+------------------------- */
+
 function extractBlocks(text) {
   const store = [];
 
   text = text.replace(/```(\w+)?\n([\s\S]*?)```/g, (_, lang, code) => {
     const type = lang || "text";
-
     const handler = BlockRegistry.get(type);
 
-    const block = {
-      type,
-      content: code
-    };
-
     if (handler) {
-      const html = handler(block);
+      const html = handler({ content: code, lang: type });
       const id = store.length;
-
       store.push(html);
-      return `@@BLOCK_${id}@@`;
+      return `@@B${id}@@`;
     }
 
-    // fallback (no plugin registered)
     const safe = escapeHtml(code);
     const fallback = `<pre><code>${safe}</code></pre>`;
-
     const id = store.length;
-    store.push(fallback);
 
-    return `@@BLOCK_${id}@@`;
+    store.push(fallback);
+    return `@@B${id}@@`;
   });
 
   return { text, store };
 }
 
-function buildList(block) {
-  const lines = block.split("\n");
+/* -------------------------
+   INLINE PHASE
+------------------------- */
 
-  let html = "";
-  let stack = [{ level: 0, html: "<ul>" }];
-
-  const getLevel = (line) => line.match(/^\s*/)[0].length;
-
-  for (let line of lines) {
-    const isOrdered = /^\s*\d+\./.test(line);
-    const isUnordered = /^\s*[-*]/.test(line);
-
-    if (!isOrdered && !isUnordered) continue;
-
-    const level = getLevel(line);
-    const content = line.replace(/^\s*([-*]|\d+\.)\s*/, "");
-
-    const tag = isOrdered ? "ol" : "ul";
-
-    // adjust nesting
-    let current = stack[stack.length - 1];
-
-    if (level > current.level) {
-      stack.push({ level, html: `<${tag}><li>${content}` });
-    } else {
-      while (stack.length && level < stack[stack.length - 1].level) {
-        const closed = stack.pop();
-        stack[stack.length - 1].html += closed.html + `</${tag}>`;
-      }
-      stack[stack.length - 1].html += `<li>${content}`;
-    }
-  }
-
-  while (stack.length > 1) {
-    const closed = stack.pop();
-    stack[stack.length - 1].html += closed.html + "</ul>";
-  }
-
-  html = stack[0].html + "</ul>";
-
-  return html;
-}
-// OBSOLETE
 function renderInline(text) {
-  return text
-    .replace(/`([^`]+)`/g, "<code>$1</code>")
-    .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
-    .replace(/\*(.+?)\*/g, "<i>$1</i>")
-    .replace(/\$(.+?)\$/g, "<span class='math'>$1</span>")
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^\)]+)\)/g, `<a href="$2" target="_blank" rel="noopener">$1</a>`);
+  return InlineRegistry.apply(text);
 }
+
+/* -------------------------
+   CORE RENDER PIPELINE
+------------------------- */
 
 function renderMarkdown(src) {
-  // 1. escape early (safety baseline)
   let text = escapeHtml(src);
 
-  /* BLOCK PHASE */
-  // 2. block extraction (registry-driven)
+  // 1. block phase
   const { text: withoutBlocks, store } = extractBlocks(text);
-
   text = withoutBlocks;
 
-  /* STRUCTURE PHASE */
-  // text = renderBlocks(text);
-  
-  // 3. structural markdown (still core-owned)
+  // 2. structural markdown
   text = text
-    .replace(/^---$/gm, "<hr>")
     .replace(/^###### (.*)$/gm, "<h6>$1</h6>")
     .replace(/^##### (.*)$/gm, "<h5>$1</h5>")
     .replace(/^#### (.*)$/gm, "<h4>$1</h4>")
     .replace(/^### (.*)$/gm, "<h3>$1</h3>")
     .replace(/^## (.*)$/gm, "<h2>$1</h2>")
     .replace(/^# (.*)$/gm, "<h1>$1</h1>")
-    .replace(/^> (.*)$/gm, "<blockquote>$1</blockquote>");
+    .replace(/^> (.*)$/gm, "<blockquote>$1</blockquote>")
+    .replace(/^---$/gm, "<hr>");
 
-  // task list
-  text = text.replace(/^[-*] \[( |x)\] (.*)$/gm, (_, checked, content) => {
-    return `
-      <li class="task">
-        <input type="checkbox" ${checked === "x" ? "checked" : ""} disabled />
-        <span>${content}</span>
-      </li>
-    `;
-  });
-  
-  /* INLINE PHASE */
-  // 4. inline phase
-  // text = renderInline(text);
-  text = InlineRegistry.apply(text);
+  // 3. inline phase
+  text = renderInline(text);
 
-  /* RESTORE BLOCKS */
-  // 5. restore blocks
-  text = text.replace(/@@BLOCK_(\d+)@@/g, (_, i) => store[i]);
+  // 4. restore blocks
+  text = text.replace(/@@B(\d+)@@/g, (_, i) => store[i]);
 
-  // 6. lists (kept core for now)
-  text = text.replace(/(?:^(?:\s*[-*]|\s*\d+\.).*(\n|$))+?/gm, (block) => buildList(block.trim()));
-  
-  // 7. table
-  text = text.replace(/((?:\|.*\|\n)+)/g, (block) => {
-    const rows = block.trim().split("\n");
+  // 5. lists (simplified stable version)
+  text = text.replace(
+    /(?:^[-*] .*(\n|$))+?/gm,
+    (block) => {
+      const items = block
+        .trim()
+        .split("\n")
+        .map(l => `<li>${l.replace(/^[-*] /, "")}</li>`)
+        .join("");
 
-    const htmlRows = rows
-      .filter(r => r.includes("|"))
-      .map((row, i) => {
-        const cells = row
-          .split("|")
-          .map(c => c.trim())
-          .filter(Boolean);
-
-        const tag = i === 1 ? "th" : "td";
-
-        const htmlCells = cells
-          .map(c => `<${tag}>${c}</${tag}>`)
-          .join("");
-
-        return `<tr>${htmlCells}</tr>`;
-      })
-      .join("");
-
-    return `<table>${htmlRows}</table>`;
-  });
-  // 8. blockquote
-  text = text.replace(/(?:^> .*(\n|$))+?/gm, (block) => {
-    const content = block
-      .split("\n")
-      .map(l => l.replace(/^> ?/, ""))
-      .join("<br>");
-
-    return `<blockquote>${content}</blockquote>`;
-  });
-
-  /* FINALIZE */
-  // 9. final newline pass
-  text = text.replace(/\n/g, "<br>");
-
-  return text;
-}
-
-/* -----------------------------
-   Render Controller
-   - prevents unnecessary DOM updates
------------------------------ */
-
-function createRenderController() {
-  let last = "";
-
-  return {
-    render(content) {
-      const html = renderMarkdown(content);
-
-      if (html === last) return html;
-
-      last = html;
-      preview.innerHTML = html;
-
-      return html;
+      return `<ul>${items}</ul>`;
     }
-  };
+  );
+
+  text = text.replace(
+    /(?:^\d+\. .*(\n|$))+?/gm,
+    (block) => {
+      const items = block
+        .trim()
+        .split("\n")
+        .map(l => `<li>${l.replace(/^\d+\. /, "")}</li>`)
+        .join("");
+
+      return `<ol>${items}</ol>`;
+    }
+  );
+
+  // 6. final newline handling
+  return text.replace(/\n/g, "<br>");
 }
 
-/* -----------------------------
-   Autosave + render pipeline
------------------------------ */
+/* =========================================================
+   RENDER CONTROLLER
+========================================================= */
 
-function createEditorLoop(controller) {
-  const save = debounce((value) => {
-    storage.save(value);
-  }, 250);
+const RenderController = {
+  last: "",
 
-  const render = debounce(() => {
+  render(value) {
+    const html = renderMarkdown(value);
+
+    if (html === this.last) return;
+
+    this.last = html;
+    preview.innerHTML = html;
+
+    EventBus.emit("render:update", html);
+  }
+};
+
+/* =========================================================
+   UX SYSTEM
+========================================================= */
+
+/* -------------------------
+   scroll sync
+------------------------- */
+
+function attachScrollSync() {
+  let ticking = false;
+
+  editor.addEventListener("scroll", () => {
+    if (ticking) return;
+    ticking = true;
+
+    requestAnimationFrame(() => {
+      const ratio =
+        editor.scrollTop /
+        Math.max(1, editor.scrollHeight - editor.clientHeight);
+
+      preview.scrollTop =
+        ratio *
+        Math.max(1, preview.scrollHeight - preview.clientHeight);
+
+      ticking = false;
+    });
+  });
+}
+
+/* -------------------------
+   autosave + input loop
+------------------------- */
+
+function createLoop() {
+  const save = debounce((v) => storage.save(v), 200);
+
+  const update = debounce(() => {
     const value = editor.value;
 
-    controller.render(value);
+    RenderController.render(value);
     save(value);
-  }, 50);
 
-  return { render };
+    EventBus.emit("editor:update", value);
+  }, 40);
+
+  return { update };
 }
 
-/* -----------------------------
-   Theme system (basic hook)
------------------------------ */
+/* =========================================================
+   INIT PLUGINS (example hooks)
+========================================================= */
 
-function initTheme() {
-  const saved = localStorage.getItem(state.themeKey);
+function initPlugins() {
+  const ctx = createPluginContext();
 
-  if (saved === "dark") {
-    document.documentElement.setAttribute("data-theme", "dark");
-  } else if (saved === "light") {
-    document.documentElement.setAttribute("data-theme", "light");
-  } else {
-    // system default
-    document.documentElement.removeAttribute("data-theme");
-  }
+  // Example JS block plugin
+  PluginRuntime.register({
+    name: "js-block",
+    init(ctx) {
+      ctx.BlockRegistry.register("js", (b) => {
+        return `<pre><code>${escapeHtml(b.content)}</code></pre>`;
+      });
+    }
+  });
+
+  PluginRuntime.enable("js-block", ctx);
 }
 
-/* -----------------------------
-   App bootstrap
------------------------------ */
+/* =========================================================
+   BOOT
+========================================================= */
 
 function init() {
   editor = document.querySelector("#editor");
   preview = document.querySelector("#preview");
 
-  initTheme();
-
-  const controller = createRenderController();
-  const loop = createEditorLoop(controller);
-
   // load saved content
   editor.value = storage.load();
 
+  initPlugins();
+
+  attachScrollSync();
+
+  const loop = createLoop();
+
+  editor.addEventListener("input", loop.update);
+
   // initial render
-  controller.render(editor.value);
-
-  // input → pipeline
-  editor.addEventListener("input", loop.render);
-
-  // scroll sync
-  attachScrollSync(editor, preview);
-  BlockRegistry.register("js", (block) => {
-     const code = escapeHtml(block.content);
-     // very simple highlight (still core-safe)
-     const highlighted = code.replace(/\b(const|let|function|return|if|for)\b/g, "<span class='kw'>$1</span>");
-     return `<pre><code class="lang-js">${highlighted}</code></pre>`;
-     }
-  );
-  InlineRegistry.register("code", /`([^`]+)`/g, (_, code) =>`<code>${code}</code>`,);
-  InlineRegistry.register("links", /\[([^\]]+)\]\((https?:\/\/[^\)]+)\)/g, (_, label, url) =>`<a href="${url}" target="_blank" rel="noopener">${label}</a>`, 10);
-  InlineRegistry.register("bold", /\*\*(.+?)\*\*/g, (_, text) => `<strong>${text}</strong>`, 20);
-  InlineRegistry.register("italic", /\*(.+?)\*/g, (_, text) =>`<em>${text}</em>`, 30);
-  InlineRegistry.register("math", /\$(.+?)\$/g, (_, expr) =>`<span class="math">${expr}</span>`, 40);
-  InlineRegistry.register("highlight", /==(.+?)==/g, (_, text) =>`<mark>${text}</mark>`, 50);
+  RenderController.render(editor.value);
 }
-
-/* -----------------------------
-   boot
------------------------------ */
 
 document.addEventListener("DOMContentLoaded", init);
