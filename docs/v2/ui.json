@@ -1,0 +1,20 @@
+{
+  "type": "page",
+  "theme": "system",
+  "children": [
+    {
+      "type": "main",
+      "role": "editor-shell",
+      "children": [
+        {
+          "type": "section",
+          "role": "editor-panel"
+        },
+        {
+          "type": "section",
+          "role": "preview-panel"
+        }
+      ]
+    }
+  ]
+}
