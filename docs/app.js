@@ -99,6 +99,24 @@ const BlockRegistry = {
     return this.blocks.get(type);
   }
 };
+const InlineRegistry = {
+
+  rules: [],
+
+  register(name, pattern, renderer, priority = 100) {
+    this.rules.push({name, pattern, renderer, priority});
+
+    // smaller number runs first
+    this.rules.sort((a, b) => a.priority - b.priority);
+  },
+
+  apply(text) {
+    for (const rule of this.rules) {
+      text = text.replace(rule.pattern, rule.renderer);
+    }
+    return text;
+  }
+};
 
 function extractBlocks(text) {
   const store = [];
@@ -176,28 +194,29 @@ function buildList(block) {
 
   return html;
 }
-
+// OBSOLETE
 function renderInline(text) {
   return text
     .replace(/`([^`]+)`/g, "<code>$1</code>")
     .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
     .replace(/\*(.+?)\*/g, "<i>$1</i>")
     .replace(/\$(.+?)\$/g, "<span class='math'>$1</span>")
-    .replace(
-      /\[([^\]]+)\]\((https?:\/\/[^\)]+)\)/g,
-      `<a href="$2" target="_blank" rel="noopener">$1</a>`
-    );
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\)]+)\)/g, `<a href="$2" target="_blank" rel="noopener">$1</a>`);
 }
 
 function renderMarkdown(src) {
   // 1. escape early (safety baseline)
   let text = escapeHtml(src);
 
+  /* BLOCK PHASE */
   // 2. block extraction (registry-driven)
   const { text: withoutBlocks, store } = extractBlocks(text);
 
   text = withoutBlocks;
 
+  /* STRUCTURE PHASE */
+  text = renderBlocks(text);
+  
   // 3. structural markdown (still core-owned)
   text = text
     .replace(/^---$/gm, "<hr>")
@@ -218,9 +237,13 @@ function renderMarkdown(src) {
       </li>
     `;
   });
+  
+  /* INLINE PHASE */
   // 4. inline phase
-  text = renderInline(text);
+  // text = renderInline(text);
+  text = InlineRegistry.apply(text);
 
+  /* RESTORE BLOCKS */
   // 5. restore blocks
   text = text.replace(/@@BLOCK_(\d+)@@/g, (_, i) => store[i]);
 
@@ -261,6 +284,7 @@ function renderMarkdown(src) {
     return `<blockquote>${content}</blockquote>`;
   });
 
+  /* FINALIZE */
   // 9. final newline pass
   text = text.replace(/\n/g, "<br>");
 
@@ -356,6 +380,12 @@ function init() {
      return `<pre><code class="lang-js">${highlighted}</code></pre>`;
      }
   );
+  InlineRegistry.register("code", /`([^`]+)`/g, (_, code) =>`<code>${code}</code>`,);
+  InlineRegistry.register("links", /\[([^\]]+)\]\((https?:\/\/[^\)]+)\)/g, (_, label, url) =>`<a href="${url}" target="_blank" rel="noopener">${label}</a>`, 10);
+  InlineRegistry.register("bold", /\*\*(.+?)\*\*/g, (_, text) => `<strong>${text}</strong>`, 20);
+  InlineRegistry.register("italic", /\*(.+?)\*/g, (_, text) =>`<em>${text}</em>`, 30);
+  InlineRegistry.register("math", /\$(.+?)\$/g, (_, expr) =>`<span class="math">${expr}</span>`, 40);
+  InlineRegistry.register("highlight", /==(.+?)==/g, (_, text) =>`<mark>${text}</mark>`, 50);
 }
 
 /* -----------------------------
