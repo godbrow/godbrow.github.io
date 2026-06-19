@@ -1,25 +1,47 @@
 
 /* =========================================================
-   SDUI + TRANSACTION + NORMALIZATION ENGINE (v11)
+   SINGLE APP CORE (v12)
+   - unified state
+   - SDUI contract
+   - transaction engine
+   - normalization engine
 ========================================================= */
 
-/* =========================================================
-   UI CONTRACT
-========================================================= */
+const EditorApp = {
 
-const UI = {
-  editorPanel: null,
-  previewPanel: null
-};
+  /* -------------------------
+     UI CONTRACT
+  ------------------------- */
+  UI: {
+    editorPanel: null,
+    previewPanel: null
+  },
 
-/* =========================================================
-   DOCUMENT MODEL
-========================================================= */
+  /* -------------------------
+     STATE
+  ------------------------- */
+  state: {
+    blocks: [],
+    blockCache: new Map(),
+    activeBlockId: null
+  },
 
-const DocumentModel = {
-  blocks: [],
-  set(b) { this.blocks = b; },
-  get() { return this.blocks; }
+  /* -------------------------
+     CURSOR
+  ------------------------- */
+  cursor: {
+    blockId: null,
+    offset: 0
+  },
+
+  /* -------------------------
+     TRANSACTION TYPES
+  ------------------------- */
+  TX: {
+    UPDATE: "update",
+    SPLIT: "split",
+    MERGE: "merge"
+  }
 };
 
 /* =========================================================
@@ -33,14 +55,16 @@ function createBlock(type = "paragraph", text = "") {
 }
 
 /* =========================================================
-   TRANSACTIONS
+   DOCUMENT HELPERS
 ========================================================= */
 
-const TX = {
-  UPDATE: "update",
-  SPLIT: "split",
-  MERGE: "merge"
-};
+function getBlocks() {
+  return EditorApp.state.blocks;
+}
+
+function setBlocks(b) {
+  EditorApp.state.blocks = b;
+}
 
 /* =========================================================
    TRANSACTION ENGINE
@@ -50,16 +74,16 @@ const TransactionEngine = {
 
   apply(tx) {
 
-    const blocks = DocumentModel.get();
+    const blocks = getBlocks();
 
     switch (tx.type) {
 
-      case TX.UPDATE: {
+      case EditorApp.TX.UPDATE: {
         tx.block.text = tx.value;
         break;
       }
 
-      case TX.SPLIT: {
+      case EditorApp.TX.SPLIT: {
         const { block, pos } = tx;
 
         const before = block.text.slice(0, pos);
@@ -76,14 +100,11 @@ const TransactionEngine = {
         break;
       }
 
-      case TX.MERGE: {
+      case EditorApp.TX.MERGE: {
         const { block } = tx;
 
-        const blocks = DocumentModel.get();
         const idx = blocks.indexOf(block);
-
         if (idx === 0 && blocks.length > 1) {
-          // merge downward fallback
           const next = blocks[1];
           next.text = block.text + next.text;
           blocks.splice(idx, 1);
@@ -105,20 +126,20 @@ const TransactionEngine = {
 };
 
 /* =========================================================
-   NORMALIZATION ENGINE (🔥 CORE ADDITION)
+   NORMALIZATION ENGINE
 ========================================================= */
 
 const Normalizer = {
 
   run() {
-    const blocks = DocumentModel.get();
+
+    const blocks = getBlocks();
 
     if (blocks.length === 0) {
       blocks.push(createBlock("paragraph", ""));
       return;
     }
 
-    // RULE 1: remove duplicate empty blocks
     for (let i = blocks.length - 1; i >= 1; i--) {
       if (blocks[i].text === "" && blocks[i - 1].text === "") {
         blocks[i - 1].text += blocks[i].text;
@@ -126,12 +147,6 @@ const Normalizer = {
       }
     }
 
-    // RULE 2: ensure at least one block exists
-    if (blocks.length === 0) {
-      blocks.push(createBlock("paragraph", ""));
-    }
-
-    // RULE 3: ensure no dangling null states
     for (const b of blocks) {
       if (b.text == null) b.text = "";
     }
@@ -139,17 +154,7 @@ const Normalizer = {
 };
 
 /* =========================================================
-   STATE
-========================================================= */
-
-let editorPanel = null;
-let previewPanel = null;
-
-const BlockCache = new Map();
-let activeBlockId = null;
-
-/* =========================================================
-   SCHEDULING
+   RENDER SCHEDULING
 ========================================================= */
 
 let editorQueued = false;
@@ -159,9 +164,11 @@ function queueEditorRender() {
   if (editorQueued) return;
 
   editorQueued = true;
+
   requestAnimationFrame(() => {
     editorQueued = false;
-    Normalizer.run();        // 🔥 IMPORTANT
+
+    Normalizer.run();
     renderEditor();
   });
 }
@@ -170,6 +177,7 @@ function queuePreviewRender() {
   if (previewQueued) return;
 
   previewQueued = true;
+
   requestAnimationFrame(() => {
     previewQueued = false;
     renderPreview();
@@ -177,24 +185,20 @@ function queuePreviewRender() {
 }
 
 /* =========================================================
-   CURSOR
+   CURSOR HELPERS
 ========================================================= */
 
-const Cursor = {
-  blockId: null,
-  offset: 0
-};
-
 function saveCursor(el, block) {
-  Cursor.blockId = block.id;
-  Cursor.offset = el.selectionStart ?? el.innerText.length;
+  EditorApp.cursor.blockId = block.id;
+  EditorApp.cursor.offset = el.selectionStart ?? el.innerText.length;
 }
 
 function restoreCursor() {
+
   requestAnimationFrame(() => {
 
-    const el = editorPanel.querySelector(
-      `[data-id="${Cursor.blockId}"]`
+    const el = EditorApp.UI.editorPanel.querySelector(
+      `[data-id="${EditorApp.cursor.blockId}"]`
     );
 
     if (!el) return;
@@ -202,13 +206,16 @@ function restoreCursor() {
     el.focus();
 
     try {
-      el.setSelectionRange(Cursor.offset, Cursor.offset);
+      el.setSelectionRange(
+        EditorApp.cursor.offset,
+        EditorApp.cursor.offset
+      );
     } catch {}
   });
 }
 
 /* =========================================================
-   SDUI (UNCHANGED BUT SAFE)
+   SDUI LAYER
 ========================================================= */
 
 async function loadUI() {
@@ -218,10 +225,13 @@ async function loadUI() {
 
   buildUI(schema, document.body);
 
-  UI.editorPanel = document.querySelector('[role="editor-panel"]');
-  UI.previewPanel = document.querySelector('[role="preview-panel"]');
+  EditorApp.UI.editorPanel =
+    document.querySelector('[role="editor-panel"]');
 
-  if (!UI.editorPanel || !UI.previewPanel) {
+  EditorApp.UI.previewPanel =
+    document.querySelector('[role="preview-panel"]');
+
+  if (!EditorApp.UI.editorPanel || !EditorApp.UI.previewPanel) {
     throw new Error("UI CONTRACT FAILED");
   }
 }
@@ -263,17 +273,17 @@ function createBlockElement(block) {
   el.dataset.id = block.id;
 
   el.addEventListener("focus", () => {
-    activeBlockId = block.id;
+    EditorApp.state.activeBlockId = block.id;
   });
 
   el.addEventListener("blur", () => {
-    activeBlockId = null;
+    EditorApp.state.activeBlockId = null;
   });
 
   el.addEventListener("input", () => {
 
     TransactionEngine.apply({
-      type: TX.UPDATE,
+      type: EditorApp.TX.UPDATE,
       block,
       value: el.innerText
     });
@@ -284,7 +294,9 @@ function createBlockElement(block) {
     queueEditorRender();
   });
 
-  el.addEventListener("keydown", (e) => handleKey(e, el, block));
+  el.addEventListener("keydown", (e) =>
+    handleKey(e, el, block)
+  );
 
   return el;
 }
@@ -293,12 +305,10 @@ function createBlockElement(block) {
    RENDER EDITOR
 ========================================================= */
 
-const BlockCache = new Map();
-
 function renderEditor() {
 
-  const blocks = DocumentModel.get();
-  const container = UI.editorPanel;
+  const blocks = getBlocks();
+  const container = EditorApp.UI.editorPanel;
 
   const active = new Set();
 
@@ -306,14 +316,14 @@ function renderEditor() {
 
     active.add(block.id);
 
-    let el = BlockCache.get(block.id);
+    let el = EditorApp.state.blockCache.get(block.id);
 
     if (!el) {
       el = createBlockElement(block);
-      BlockCache.set(block.id, el);
+      EditorApp.state.blockCache.set(block.id, el);
     }
 
-    if (block.id !== activeBlockId) {
+    if (block.id !== EditorApp.state.activeBlockId) {
       el.innerText = block.text;
     }
 
@@ -322,10 +332,10 @@ function renderEditor() {
     }
   }
 
-  for (const [id, el] of BlockCache.entries()) {
+  for (const [id, el] of EditorApp.state.blockCache.entries()) {
     if (!active.has(id)) {
       el.remove();
-      BlockCache.delete(id);
+      EditorApp.state.blockCache.delete(id);
     }
   }
 }
@@ -342,7 +352,7 @@ function handleKey(e, el, block) {
     e.preventDefault();
 
     const tx = {
-      type: TX.SPLIT,
+      type: EditorApp.TX.SPLIT,
       block,
       pos
     };
@@ -352,8 +362,8 @@ function handleKey(e, el, block) {
     queueEditorRender();
     queuePreviewRender();
 
-    Cursor.blockId = tx.result.id;
-    Cursor.offset = 0;
+    EditorApp.cursor.blockId = tx.result.id;
+    EditorApp.cursor.offset = 0;
 
     restoreCursor();
     return;
@@ -361,13 +371,11 @@ function handleKey(e, el, block) {
 
   if (e.key === "Backspace") {
 
-    const pos = el.selectionStart ?? el.innerText.length;
-
     if (pos === 0) {
       e.preventDefault();
 
       const tx = {
-        type: TX.MERGE,
+        type: EditorApp.TX.MERGE,
         block
       };
 
@@ -377,8 +385,8 @@ function handleKey(e, el, block) {
       queuePreviewRender();
 
       if (tx.result) {
-        Cursor.blockId = tx.result.id;
-        Cursor.offset = tx.result.text.length;
+        EditorApp.cursor.blockId = tx.result.id;
+        EditorApp.cursor.offset = tx.result.text.length;
         restoreCursor();
       }
     }
@@ -401,16 +409,17 @@ function renderMarkdown(text) {
 
 function renderPreview() {
 
-  if (!UI.previewPanel) return;
+  const panel = EditorApp.UI.previewPanel;
+  if (!panel) return;
 
-  const blocks = DocumentModel.get();
+  const blocks = getBlocks();
 
-  UI.previewPanel.innerHTML = "";
+  panel.innerHTML = "";
 
   for (const b of blocks) {
     const el = document.createElement("div");
     el.innerHTML = renderMarkdown(b.text);
-    UI.previewPanel.appendChild(el);
+    panel.appendChild(el);
   }
 }
 
@@ -422,7 +431,7 @@ async function init() {
 
   await loadUI();
 
-  DocumentModel.set([createBlock("paragraph", "")]);
+  setBlocks([createBlock("paragraph", "")]);
 
   renderEditor();
   renderPreview();
