@@ -37,7 +37,7 @@
   --code-bg: #2d2d2d;
 }
 
-/* ===== Reset & Layout ===== */
+/* ===== Reset & Base Grid ===== */
 * {
   box-sizing: border-box;
   margin: 0;
@@ -46,7 +46,12 @@
 
 body {
   display: grid;
+  grid-template-areas:
+    "head head head"
+    "list edit view"
+    "foot foot foot";
   grid-template-rows: auto 1fr auto;
+  grid-template-columns: minmax(160px, 220px) 1fr minmax(200px, 300px);
   height: 100vh;
   font-family: var(--font-sans);
   font-size: var(--font-size);
@@ -57,7 +62,8 @@ body {
 }
 
 /* ===== Header ===== */
-#head {
+body > header {
+  grid-area: head;
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -77,23 +83,18 @@ body {
   gap: 0.25rem;
 }
 
-/* ===== Main row: three columns ===== */
-#mainrow {
-  display: grid;
-  grid-template-columns: minmax(160px, 220px) 1fr minmax(200px, 300px);
-  overflow: hidden;
-}
-
-/* ===== Sidebar (file list) ===== */
-#list {
+/* ===== Left Sidebar (file list) ===== */
+body > aside:first-of-type {
+  grid-area: list;
   overflow-y: auto;
   background: var(--surface);
   border-right: 1px solid var(--border);
   padding: var(--gap);
 }
 
-/* ===== Editor ===== */
-#edit {
+/* ===== Main Editor ===== */
+body > main {
+  grid-area: edit;
   display: grid;
   grid-template-columns: 3em 1fr;
   overflow: hidden;
@@ -117,7 +118,7 @@ body {
   overflow-x: auto;
 }
 
-/* ===== Virtual lines (absolutely positioned) ===== */
+/* ===== Virtual Lines ===== */
 .line {
   position: absolute;
   left: 0;
@@ -143,13 +144,12 @@ body {
   overflow: hidden;
 }
 
-/* Sizing sentinel (invisible height placeholder) */
 .sentinel {
   width: 1px;
   pointer-events: none;
 }
 
-/* ===== Token classes (single‑word) ===== */
+/* ===== Token classes ===== */
 .keyword  { color: var(--keyword); }
 .string   { color: var(--string); }
 .comment  { color: var(--comment); font-style: italic; }
@@ -159,45 +159,44 @@ body {
 .emphasis { font-style: italic; }
 .code     { color: var(--text); background: var(--code-bg); border-radius: 2px; }
 
-/* ===== Block classes (single‑word) ===== */
+/* ===== Block classes ===== */
 .heading {
   font-size: var(--block-heading-size);
   font-weight: var(--block-heading-weight);
   color: var(--text);
 }
-
-.list {
+.list-block {   /* renamed to avoid selector clash with aside */
   padding-left: var(--block-list-indent);
 }
-
 .quote {
   border-left: 3px solid var(--fade);
   padding-left: 0.5em;
   color: var(--fade);
   font-style: italic;
 }
-
 .codeblock {
   background: var(--code-bg);
   font-family: var(--font-mono);
   white-space: pre;
 }
 
-/* ===== Preview iframe ===== */
-#view {
+/* ===== Right Sidebar (preview) ===== */
+body > aside:last-of-type {
+  grid-area: view;
   overflow: hidden;
   border-left: 1px solid var(--border);
   background: var(--bg);
 }
 
-#preview {
+body > aside:last-of-type > iframe {
   width: 100%;
   height: 100%;
   border: none;
 }
 
 /* ===== Footer ===== */
-#foot {
+body > footer {
+  grid-area: foot;
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -210,11 +209,16 @@ body {
 
 /* ===== Responsive ===== */
 @media (max-width: 768px) {
-  #mainrow {
+  body {
+    grid-template-areas:
+      "head"
+      "edit"
+      "foot";
     grid-template-columns: 1fr;
   }
 
-  #list, #view {
+  body > aside:first-of-type,
+  body > aside:last-of-type {
     display: none;
     position: absolute;
     top: 0;
@@ -224,27 +228,25 @@ body {
     box-shadow: 2px 0 8px rgba(0,0,0,0.2);
   }
 
-  #list.open, #view.open {
+  body > aside:first-of-type.open,
+  body > aside:last-of-type.open {
     display: block;
-  }
-
-  #edit {
-    grid-template-columns: 2.5em 1fr;
   }
 }
 
 /* ===== Print ===== */
 @media print {
   body {
-    grid-template-rows: 1fr;
+    grid-template-areas: "edit";
+    grid-template-columns: 1fr;
     background: #fff;
     color: #000;
   }
-  #head, #list, #view, #foot {
+  body > header,
+  body > aside:first-of-type,
+  body > aside:last-of-type,
+  body > footer {
     display: none;
-  }
-  #edit {
-    display: block;
   }
   .gutter {
     display: none;
