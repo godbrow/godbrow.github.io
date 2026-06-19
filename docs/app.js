@@ -1,102 +1,58 @@
 // app.js – v1 Editor (ES module, no dependencies)
 
-// ----- Utility functions -----
-// Fetch a resource and return parsed JSON or text
+// ---------- Utility ----------
 const load = async (url) => {
   const res = await fetch(url);
   if (!res.ok) throw Error(`Failed to load ${url}`);
-  return res.headers.get('content-type')?.includes('json') ? res.json() : res.text();
+  const ct = res.headers.get('content-type') || '';
+  return ct.includes('json') ? res.json() : res.text();
 };
 
-// Recursively build DOM from SDUI node (ui.json)
 const build = (node) => {
+  // Support fragments (no wrapper element)
+  if (node.fragment) {
+    const frag = document.createDocumentFragment();
+    node.children.forEach(child => frag.appendChild(build(child)));
+    return frag;
+  }
   const el = document.createElement(node.tag);
-  if (node.attrs) Object.entries(node.attrs).forEach(([k, v]) => el.setAttribute(k, v));
-  if (node.children) node.children.forEach(child => el.appendChild(build(child)));
+  if (node.attrs) {
+    Object.entries(node.attrs).forEach(([k, v]) => el.setAttribute(k, v));
+  }
+  if (node.children) {
+    node.children.forEach(child => el.appendChild(build(child)));
+  }
   return el;
 };
 
-// Map a pixel Y coordinate to line index and column
-const map = (y, heights, scrollTop) => {
-  let acc = 0;
-  for (let i = 0; i < heights.length; i++) {
-    acc += heights[i];
-    if (y - scrollTop < acc) return { line: i, col: 0 }; // column calculation done later if needed
-  }
-  return { line: heights.length - 1, col: 0 };
-};
+// Escape HTML for preview safety
+const escape = (str) => str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-// ----- Store (Observable state) -----
-class Store {
-  #state = { tabs: [], active: null, docs: [], theme: 'light' };
-  #subs = [];
-
-  get tabs() { return this.#state.tabs; }
-  get active() { return this.#state.active; }
-  get docs() { return this.#state.docs; }
-  get theme() { return this.#state.theme; }
-  #notify(changed) { this.#subs.forEach(fn => fn(changed, this.#state)); }
-
-  dispatch(action, payload) {
-    const prev = { ...this.#state };
-    switch (action) {
-      case 'tab': this.#state.tabs = payload; break;
-      case 'active': this.#state.active = payload; break;
-      case 'docs': this.#state.docs = payload; break;
-      case 'theme': this.#state.theme = payload; document.documentElement.classList.toggle('dark', payload === 'dark'); break;
-      case 'doc': {
-        const { id, text } = payload;
-        const doc = this.#state.docs.find(d => d.id === id);
-        if (doc) doc.text = text;
-        break;
-      }
-    }
-    this.#persist(action);
-    this.#notify(action);
-  }
-
-  subscribe(fn) { this.#subs.push(fn); }
-
-  #persist(action) {
-    if (['tab', 'active'].includes(action)) localStorage.setItem('tabs', JSON.stringify(this.#state.tabs));
-    if (action === 'active') localStorage.setItem('active', this.#state.active);
-    if (action === 'docs') localStorage.setItem('docs', JSON.stringify(this.#state.docs.map(d => ({ id: d.id, name: d.name, mode: d.mode, stamp: d.stamp }))));
-    if (action === 'theme') localStorage.setItem('theme', this.#state.theme);
-  }
-
-  load() {
-    const tabs = JSON.parse(localStorage.getItem('tabs') || '[]');
-    const active = localStorage.getItem('active') || null;
-    const docs = JSON.parse(localStorage.getItem('docs') || '[]');
-    const theme = localStorage.getItem('theme') || 'light';
-    this.#state = { tabs, active, docs, theme };
-    document.documentElement.classList.toggle('dark', theme === 'dark');
-  }
-}
-
-// ----- Plugin system -----
+// ---------- Plugin system ----------
 const plug = {};
 
 const register = (plugin) => {
   plug[plugin.mode] = plugin;
 };
 
-// Built‑in: Text (plain)
+// ---- Built‑in: Text ----
 register({
-  mode: 'txt', name: 'Text',
+  mode: 'txt',
+  name: 'Text',
   start: () => ({}),
   line: (line, ctx) => [{ kind: 'text', span: line }],
-  block: () => ({ kind: 'para' }),
+  block: (ctx) => ({ kind: 'para' }),
   render: (text) => `<pre>${escape(text)}</pre>`
 });
 
-// Built‑in: Markdown (stateful parser)
+// ---- Built‑in: Markdown (stateful) ----
 register({
-  mode: 'md', name: 'Markdown',
-  start: () => ({ fence: false, indent: 0, list: false }),
+  mode: 'md',
+  name: 'Markdown',
+  start: () => ({ fence: false }),
   line: (line, ctx) => {
     const tokens = [];
-    // Fenced code block
+    // Fenced code block toggle
     if (line.startsWith('```')) {
       ctx.fence = !ctx.fence;
       tokens.push({ kind: 'marker', span: '```' });
@@ -107,81 +63,88 @@ register({
       tokens.push({ kind: 'text', span: line });
       return tokens;
     }
-    // Headings
+    // Heading
     if (/^#{1,6}\s/.test(line)) {
       const m = line.match(/^(#{1,6})\s(.*)/);
-      tokens.push({ kind: 'marker', span: m[1] + ' ' });
-      tokens.push({ kind: 'text', span: m[2] });
-      return tokens;
+      if (m) {
+        tokens.push({ kind: 'marker', span: m[1] + ' ' });
+        tokens.push({ kind: 'text', span: m[2] });
+        return tokens;
+      }
     }
     // Unordered list
     if (/^\s*[-*+]\s/.test(line)) {
       const m = line.match(/^(\s*)([-*+])\s(.*)/);
-      tokens.push({ kind: 'marker', span: m[1] + m[2] + ' ' });
-      tokens.push({ kind: 'text', span: m[3] });
-      return tokens;
+      if (m) {
+        tokens.push({ kind: 'marker', span: m[1] + m[2] + ' ' });
+        tokens.push({ kind: 'text', span: m[3] });
+        return tokens;
+      }
     }
-    // Bold/italic spans are simple for v1: just tokenise as text (full inline parsing later)
+    // Blockquote
+    if (/^>\s/.test(line)) {
+      const m = line.match(/^>\s(.*)/);
+      if (m) {
+        tokens.push({ kind: 'marker', span: '> ' });
+        tokens.push({ kind: 'text', span: m[1] });
+        return tokens;
+      }
+    }
+    // Default: all text
     tokens.push({ kind: 'text', span: line });
     return tokens;
   },
   block: (ctx) => {
     if (ctx.fence) return { kind: 'codeblock' };
-    // The line's block kind is determined later from the first token's kind? 
-    // For simplicity we return para; inline styling works via tokens.
+    // The block kind is determined during rendering based on the first token.
+    // This method is called after line() for the line, but we need to decide based on content.
+    // For simplicity, we return a generic kind and let the renderer inspect the line again.
+    // Better approach: cache per line in ctx during line(), but v1 uses a simple heuristic.
+    // We'll handle block classes in the editor by re‑inspecting the line string.
+    // Return 'para' – actual block class will be set by editor’s own logic.
     return { kind: 'para' };
   },
   render: (text) => {
-    // Minimal Markdown → HTML converter (handles headings, lists, bold, italic, code)
-    let html = text;
+    let html = escape(text);
     // Code blocks (```)
     html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
     // Headings
-    html = html.replace(/^#{1,6}\s(.*)$/gm, (_, content) => {
-      const level = _.indexOf(' ');
+    html = html.replace(/^#{1,6}\s(.*)$/gm, (line) => {
+      const level = line.match(/^(#{1,6})/)[1].length;
+      const content = line.replace(/^#{1,6}\s/, '');
       return `<h${level}>${content}</h${level}>`;
     });
-    // Bold
-    html = html.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
-    // Italic
-    html = html.replace(/\*(.*?)\*/g, '<em>$1</em>');
+    // Bold and italic
+    html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
     // Inline code
-    html = html.replace(/`(.*?)`/g, '<code>$1</code>');
+    html = html.replace(/`(.+?)`/g, '<code>$1</code>');
     // Unordered list
     html = html.replace(/^\s*[-*+]\s(.*)$/gm, '<li>$1</li>');
     html = html.replace(/(<li>.*<\/li>)/s, '<ul>$1</ul>');
+    // Blockquote
+    html = html.replace(/^>\s(.*)$/gm, '<blockquote>$1</blockquote>');
     return html;
   }
 });
 
-// Built‑in: HTML, CSS, JS – similar tokenisers with simple keyword lists
-// (Added for brevity: same pattern as txt but with some token kinds)
-register({
-  mode: 'html', name: 'HTML',
-  start: () => ({}),
-  line: (line) => [{ kind: 'text', span: line }], // simplified
-  block: () => ({ kind: 'para' }),
-  render: (text) => text
-});
-register({
-  mode: 'css', name: 'CSS',
-  start: () => ({}),
-  line: (line) => [{ kind: 'text', span: line }],
-  block: () => ({ kind: 'para' }),
-  render: (text) => `<style>${text}</style>`
-});
-register({
-  mode: 'js', name: 'JavaScript',
-  start: () => ({}),
-  line: (line) => [{ kind: 'text', span: line }],
-  block: () => ({ kind: 'para' }),
-  render: (text) => `<script>${text}</script>`
+// ---- Built‑in: HTML, CSS, JS (simplified) ----
+['html', 'css', 'js'].forEach(mode => {
+  register({
+    mode,
+    name: mode.toUpperCase(),
+    start: () => ({}),
+    line: (line) => [{ kind: 'text', span: line }],
+    block: () => ({ kind: 'para' }),
+    render: (text) => {
+      if (mode === 'html') return text;
+      if (mode === 'css') return `<style>${text}</style>`;
+      if (mode === 'js') return `<script>${text}</script>`;
+    }
+  });
 });
 
-// Helper escape for HTML
-const escape = (str) => str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-
-// ----- Undo/Redo Commands -----
+// ---------- Undo / Redo ----------
 class Insert {
   constructor(line, col, text) { this.line = line; this.col = col; this.text = text; }
   apply(doc) {
@@ -191,70 +154,257 @@ class Insert {
   }
   undo(doc) {
     const lines = doc.split('\n');
-    lines[this.line] = lines[this.line].slice(0, this.col) + lines[this.line].slice(this.col + this.text.length);
+    const len = this.text.length;
+    lines[this.line] = lines[this.line].slice(0, this.col) + lines[this.line].slice(this.col + len);
     return lines.join('\n');
   }
 }
+
 class Delete {
-  constructor(line, col, length) { this.line = line; this.col = col; this.length = length; }
+  constructor(line, col, text) { this.line = line; this.col = col; this.text = text; }
   apply(doc) {
     const lines = doc.split('\n');
-    lines[this.line] = lines[this.line].slice(0, this.col) + lines[this.line].slice(this.col + this.length);
+    lines[this.line] = lines[this.line].slice(0, this.col) + lines[this.line].slice(this.col + this.text.length);
     return lines.join('\n');
   }
   undo(doc) {
     const lines = doc.split('\n');
-    const original = this.orig; // must be stored before delete
-    lines[this.line] = lines[this.line].slice(0, this.col) + original + lines[this.line].slice(this.col);
+    lines[this.line] = lines[this.line].slice(0, this.col) + this.text + lines[this.line].slice(this.col);
     return lines.join('\n');
   }
 }
 
-// ----- History (per document) -----
 class History {
-  constructor(doc) { this.stack = []; this.index = -1; this.doc = doc; }
+  constructor() { this.stack = []; this.idx = -1; }
   push(cmd) {
-    this.stack = this.stack.slice(0, this.index + 1);
+    this.stack = this.stack.slice(0, this.idx + 1);
     this.stack.push(cmd);
-    this.index++;
+    this.idx++;
   }
   undo() {
-    if (this.index < 0) return null;
-    const cmd = this.stack[this.index];
-    this.index--;
-    return cmd;
+    if (this.idx < 0) return null;
+    return this.stack[this.idx--];
   }
   redo() {
-    if (this.index >= this.stack.length - 1) return null;
-    this.index++;
-    return this.stack[this.index];
+    if (this.idx >= this.stack.length - 1) return null;
+    return this.stack[++this.idx];
   }
 }
 
-// ----- Editor Component (virtualised) -----
-class Edit {
-  #store; #doc; #mode; #lines; #heights; #sentinel; #pool; #scroll; #gutter; #textarea; #parser;
-  #cursor = { line: 0, col: 0 };
-  #range = null; // { anchor, focus }
-  #history;
+// ---------- Store (central state, pub/sub) ----------
+class Store {
+  #state;
+  #subs;
 
-  constructor(store, container, gutter, content) {
+  constructor() {
+    this.#state = { tabs: [], active: null, docs: [], theme: 'light' };
+    this.#subs = [];
+  }
+
+  get tabs()  { return this.#state.tabs; }
+  get active() { return this.#state.active; }
+  get docs()  { return this.#state.docs; }
+  get theme() { return this.#state.theme; }
+
+  subscribe(fn) { this.#subs.push(fn); }
+
+  dispatch(action, data) {
+    switch (action) {
+      case 'tabs': this.#state.tabs = data; break;
+      case 'active': this.#state.active = data; break;
+      case 'docs': this.#state.docs = data; break;
+      case 'theme':
+        this.#state.theme = data;
+        document.documentElement.classList.toggle('dark', data === 'dark');
+        break;
+      case 'doc': {
+        const { id, text } = data;
+        const doc = this.#state.docs.find(d => d.id === id);
+        if (doc) doc.text = text;
+        break;
+      }
+    }
+    this.#persist(action);
+    this.#subs.forEach(fn => fn(action, this.#state));
+  }
+
+  #persist(action) {
+    if (action === 'tabs' || action === 'active') {
+      localStorage.setItem('tabs', JSON.stringify(this.#state.tabs));
+      if (action === 'active') localStorage.setItem('active', this.#state.active);
+    }
+    if (action === 'docs') {
+      localStorage.setItem('docs', JSON.stringify(
+        this.#state.docs.map(d => ({ id: d.id, name: d.name, mode: d.mode, stamp: d.stamp }))
+      ));
+    }
+    if (action === 'theme') {
+      localStorage.setItem('theme', this.#state.theme);
+    }
+  }
+
+  load() {
+    const tabs = JSON.parse(localStorage.getItem('tabs') || '[]');
+    const active = localStorage.getItem('active') || null;
+    const docs = JSON.parse(localStorage.getItem('docs') || '[]');
+    const theme = localStorage.getItem('theme') || 'light';
+    this.#state = { tabs, active, docs, theme };
+    document.documentElement.classList.toggle('dark', theme === 'dark');
+  }
+
+  // Convenience: get full text for a document id
+  text(id) {
+    return localStorage.getItem(`doc:${id}`) || '';
+  }
+  // Save text to localStorage
+  save(id, text) {
+    localStorage.setItem(`doc:${id}`, text);
+  }
+}
+
+// ---------- Head (toolbar + tabs) ----------
+class Head {
+  constructor(store, el) {
+    this.store = store;
+    this.el = el;
+    this.render();
+    store.subscribe(() => this.render());
+    this.bind();
+  }
+
+  render() {
+    const { tabs, active } = this.store;
+    this.el.querySelector('.tabs').innerHTML = tabs.map(id => {
+      const doc = this.store.docs.find(d => d.id === id);
+      const name = doc ? doc.name : id;
+      return `<span class="tab${id === active ? ' active' : ''}" data-id="${id}">${name}</span>`;
+    }).join('');
+  }
+
+  bind() {
+    // Delegate clicks on tabs
+    this.el.querySelector('.tabs').addEventListener('click', (e) => {
+      const tab = e.target.closest('.tab');
+      if (!tab) return;
+      const id = tab.dataset.id;
+      if (id) this.store.dispatch('active', id);
+    });
+    // Action buttons
+    this.el.querySelector('.actions').addEventListener('click', (e) => {
+      const btn = e.target.closest('button');
+      if (!btn) return;
+      const act = btn.dataset.action;
+      if (act === 'new') this.newDoc();
+      else if (act === 'theme') this.toggleTheme();
+      // Other actions: export, import, etc. (placeholders)
+    });
+    // Render action buttons HTML
+    this.el.querySelector('.actions').innerHTML = `
+      <button data-action="new">New</button>
+      <button data-action="theme">Theme</button>
+    `;
+  }
+
+  newDoc() {
+    const id = 'doc_' + Date.now();
+    const doc = { id, name: 'untitled', mode: 'md', stamp: Date.now() };
+    const docs = [...this.store.docs, doc];
+    this.store.dispatch('docs', docs);
+    this.store.save(id, '');
+    this.store.dispatch('tabs', [...this.store.tabs, id]);
+    this.store.dispatch('active', id);
+  }
+
+  toggleTheme() {
+    const next = this.store.theme === 'dark' ? 'light' : 'dark';
+    this.store.dispatch('theme', next);
+  }
+}
+
+// ---------- List (left sidebar – file inventory) ----------
+class List {
+  constructor(store, el) {
+    this.store = store;
+    this.el = el;
+    this.render();
+    store.subscribe(() => this.render());
+    this.bind();
+  }
+
+  render() {
+    const docs = this.store.docs;
+    this.el.innerHTML = docs.map(d => `
+      <div class="file" data-id="${d.id}">
+        <span>${d.name}</span>
+        <span class="mode">${d.mode}</span>
+      </div>
+    `).join('');
+  }
+
+  bind() {
+    this.el.addEventListener('click', (e) => {
+      const file = e.target.closest('.file');
+      if (!file) return;
+      const id = file.dataset.id;
+      // If not open, add to tabs
+      if (!this.store.tabs.includes(id)) {
+        this.store.dispatch('tabs', [...this.store.tabs, id]);
+      }
+      this.store.dispatch('active', id);
+    });
+  }
+}
+
+// ---------- Edit (virtualised editor) ----------
+class Edit {
+  #store;
+  #doc;          // current document object from store
+  #lines;        // array of line strings
+  #heights;      // measured line heights (default 24px)
+  #scroll;       // the .content element (scroll container)
+  #gutter;       // the .gutter element
+  #textarea;     // hidden textarea for input
+  #history;      // History instance
+  #parser;       // { plugin, ctx } for current mode
+  #cursor;       // { line, col } (collapsed)
+  #pool;         // array of currently visible .line elements
+
+  constructor(store, main) {
     this.#store = store;
-    this.#gutter = gutter;
-    this.#scroll = content;
-    this.#sentinel = document.createElement('div');
-    this.#sentinel.className = 'sentinel';
-    this.#scroll.appendChild(this.#sentinel);
-    this.#pool = [];
-    this.#textarea = this.#createTextarea();
+    this.#gutter = main.querySelector('.gutter');
+    this.#scroll = main.querySelector('.content');
+    this.#textarea = this.#makeTextarea();
     this.#scroll.appendChild(this.#textarea);
-    this.#bindEvents();
-    this.#store.subscribe((action) => {
+    this.#pool = [];
+    this.#heights = [];
+    this.#lines = [];
+    this.#cursor = { line: 0, col: 0 };
+    this.#history = new History();
+
+    // Sentinel div for total height
+    const sentinel = document.createElement('div');
+    sentinel.className = 'sentinel';
+    this.#scroll.appendChild(sentinel);
+    this.sentinel = sentinel;
+
+    // Events
+    this.#scroll.addEventListener('scroll', () => this.#render());
+    this.#scroll.addEventListener('mousedown', (e) => this.#onMouseDown(e));
+    this.#textarea.addEventListener('keydown', (e) => this.#onKey(e));
+    this.#textarea.addEventListener('input', (e) => this.#onInput(e));
+    // IME composition events (placeholder)
+    this.#textarea.addEventListener('compositionstart', () => {});
+    this.#textarea.addEventListener('compositionend', (e) => {
+      this.#onInput({ target: { value: e.data || '' } });
+    });
+
+    // React to store changes
+    store.subscribe((action) => {
       if (action === 'active' || action === 'docs') this.refresh();
     });
   }
 
-  #createTextarea() {
+  #makeTextarea() {
     const ta = document.createElement('textarea');
     ta.style.cssText = 'position:absolute;opacity:0;pointer-events:none;width:1px;height:1px;left:0;top:0;';
     return ta;
@@ -266,272 +416,348 @@ class Edit {
     const doc = this.#store.docs.find(d => d.id === id);
     if (!doc) return;
     this.#doc = doc;
-    this.#mode = doc.mode;
-    this.#lines = doc.text.split('\n');
-    this.#heights = new Array(this.#lines.length).fill(0); // will be measured
-    this.#history = new History(doc.text);
-    this.#parser = { plugin: plug[this.#mode] || plug.txt, ctx: plug[this.#mode].start() };
+    const text = this.#store.text(id);
+    this.#lines = text.split('\n');
+    this.#heights = new Array(this.#lines.length).fill(24);
+    this.#history = new History();
+    this.#parser = {
+      plugin: plug[doc.mode] || plug.txt,
+      ctx: (plug[doc.mode] || plug.txt).start()
+    };
     this.#cursor = { line: 0, col: 0 };
-    this.#range = null;
+    this.#clearPool();
     this.#render();
   }
 
-  #render() {
-    const existing = this.#pool;
-    existing.forEach(el => el.remove());
+  #clearPool() {
+    this.#pool.forEach(el => el.remove());
     this.#pool = [];
-    const visible = this.#visibleRange();
-    const start = visible.start;
-    const end = visible.end;
-    const frag = document.createDocumentFragment();
-    const gutterFrag = document.createDocumentFragment();
-    for (let i = start; i <= end; i++) {
-      const line = this.#lines[i] || '';
-      const tokens = this.#parser.plugin.line(line, this.#parser.ctx);
-      const blockKind = this.#parser.plugin.block(this.#parser.ctx).kind;
-      const lineEl = document.createElement('div');
-      lineEl.className = `line ${blockKind}`;
-      lineEl.style.top = `${this.#offset(i)}px`;
-      lineEl.dataset.line = i;
-      const numSpan = document.createElement('span');
-      numSpan.className = 'num';
-      numSpan.textContent = i + 1;
-      const textSpan = document.createElement('span');
-      textSpan.className = 'text';
-      tokens.forEach(t => {
-        const span = document.createElement('span');
-        span.className = t.kind; // token kind directly used as CSS class
-        span.textContent = t.span;
-        textSpan.appendChild(span);
-      });
-      lineEl.appendChild(numSpan);
-      lineEl.appendChild(textSpan);
-      frag.appendChild(lineEl);
-      // Gutter
-      const gutNum = document.createElement('div');
-      gutNum.textContent = i + 1;
-      gutNum.style.height = `${this.#heights[i] || 24}px`;
-      gutterFrag.appendChild(gutNum);
-    }
-    this.#scroll.querySelector('.content')?.appendChild(frag); // Actually content is the scroll container itself? We'll adjust.
-    // Simplify: we attach directly to scroll container (which is content div) but we need to separate gutter.
-    // For brevity, we'll handle later; the above illustrates the concept.
   }
 
-  #visibleRange() {
+  #render() {
+    // Determine visible range based on scroll
     const scrollTop = this.#scroll.scrollTop;
-    const height = this.#scroll.clientHeight;
-    let acc = 0;
-    let start = 0, end = this.#lines.length - 1;
+    const viewHeight = this.#scroll.clientHeight;
+    let start = 0, end = 0, acc = 0;
     for (let i = 0; i < this.#lines.length; i++) {
-      if (!this.#heights[i]) this.#heights[i] = 24; // default line height
-      acc += this.#heights[i];
-      if (acc >= scrollTop) {
+      const h = this.#heights[i] || 24;
+      if (acc + h > scrollTop) {
         start = i;
         break;
       }
+      acc += h;
     }
     acc = 0;
     for (let i = start; i < this.#lines.length; i++) {
-      acc += this.#heights[i];
-      if (acc > height + 200) {
+      const h = this.#heights[i] || 24;
+      acc += h;
+      if (acc > viewHeight + 200) {
         end = i;
         break;
       }
+      if (i === this.#lines.length - 1) end = i;
     }
-    return { start, end };
+
+    // Remove old lines (simple re‑creation instead of recycling for clarity)
+    this.#clearPool();
+    const frag = document.createDocumentFragment();
+    // Create gutter numbers
+    const gutterFrag = document.createDocumentFragment();
+    for (let i = start; i <= end; i++) {
+      const lineNum = document.createElement('div');
+      lineNum.textContent = i + 1;
+      lineNum.style.height = `${this.#heights[i] || 24}px`;
+      lineNum.style.lineHeight = `${this.#heights[i] || 24}px`;
+      gutterFrag.appendChild(lineNum);
+    }
+    this.#gutter.innerHTML = '';
+    this.#gutter.appendChild(gutterFrag);
+
+    // Create line elements
+    for (let i = start; i <= end; i++) {
+      const lineEl = document.createElement('div');
+      lineEl.className = 'line';
+      lineEl.style.top = `${this.#offset(i)}px`;
+      lineEl.dataset.line = i;
+
+      // Block class
+      const blockKind = this.#detectBlockKind(i);
+      if (blockKind) lineEl.classList.add(blockKind);
+
+      // Number span
+      const numSpan = document.createElement('span');
+      numSpan.className = 'num';
+      numSpan.textContent = i + 1;
+      // Text span with tokens
+      const textSpan = document.createElement('span');
+      textSpan.className = 'text';
+      const tokens = this.#tokenizeLine(i);
+      tokens.forEach(tok => {
+        const span = document.createElement('span');
+        span.className = tok.kind;  // e.g., keyword, string, marker, text
+        span.textContent = tok.span;
+        textSpan.appendChild(span);
+      });
+
+      lineEl.appendChild(numSpan);
+      lineEl.appendChild(textSpan);
+      frag.appendChild(lineEl);
+      this.#pool.push(lineEl);
+    }
+
+    this.#scroll.appendChild(frag);
+
+    // Update sentinel height
+    const total = this.#offset(this.#lines.length);
+    this.sentinel.style.height = `${total}px`;
   }
 
-  #offset(line) {
+  #offset(untilLine) {
     let o = 0;
-    for (let i = 0; i < line; i++) o += this.#heights[i] || 24;
+    for (let i = 0; i < untilLine; i++) o += this.#heights[i] || 24;
     return o;
   }
 
-  #bindEvents() {
-    this.#scroll.addEventListener('scroll', () => this.#render());
-    this.#scroll.addEventListener('mousedown', (e) => {
-      const lineEl = e.target.closest('.line');
-      if (!lineEl) return;
-      const line = parseInt(lineEl.dataset.line);
-      // compute column from click X
-      const rect = lineEl.querySelector('.text').getBoundingClientRect();
-      const col = Math.floor((e.clientX - rect.left) / 9.6); // monospace approximate
-      this.#setCursor(line, Math.max(0, col));
-      this.#textarea.focus();
-    });
-    this.#textarea.addEventListener('keydown', (e) => this.#onKey(e));
-    this.#textarea.addEventListener('input', (e) => this.#onInput(e));
-    this.#textarea.addEventListener('compositionstart', () => {});
-    this.#textarea.addEventListener('compositionend', (e) => {
-      this.#onInput({ target: { value: e.data } }); // simplified
-    });
+  // Tokenize line using plugin, resetting ctx properly
+  #tokenizeLine(lineIndex) {
+    // Reset parser context to start of document and iterate up to this line.
+    // Inefficient but safe for v1; in production we'd cache.
+    const plugin = this.#parser.plugin;
+    const ctx = plugin.start();
+    for (let i = 0; i < lineIndex; i++) {
+      plugin.line(this.#lines[i], ctx);
+    }
+    return plugin.line(this.#lines[lineIndex], ctx);
+  }
+
+  // Determine block class by checking line content (simplified)
+  #detectBlockKind(lineIndex) {
+    const line = this.#lines[lineIndex];
+    if (!line) return 'para';
+    // Fenced code block detection requires state, but for simplicity we check first char
+    if (/^```/.test(line)) return 'codeblock';
+    // Check previous line’s fence state? Not easily, so we keep it simple.
+    if (/^#{1,6}\s/.test(line)) return 'heading';
+    if (/^\s*[-*+]\s/.test(line)) return 'list-block';
+    if (/^>\s/.test(line)) return 'quote';
+    return 'para';
+  }
+
+  // Event handlers
+  #onMouseDown(e) {
+    const lineEl = e.target.closest('.line');
+    if (!lineEl) return;
+    const line = parseInt(lineEl.dataset.line, 10);
+    // Estimate column based on x relative to text span
+    const textSpan = lineEl.querySelector('.text');
+    if (!textSpan) return;
+    const rect = textSpan.getBoundingClientRect();
+    const charWidth = 9.6; // approx monospace width
+    const col = Math.max(0, Math.round((e.clientX - rect.left) / charWidth));
+    this.#setCursor(line, col);
+    this.#textarea.focus();
   }
 
   #setCursor(line, col) {
     this.#cursor = { line, col };
-    this.#range = null;
-    // Update textarea position to that line (for IME)
-    this.#textarea.value = this.#lines[line] || '';
+    // Update hidden textarea content to current line
+    const lineText = this.#lines[line] || '';
+    this.#textarea.value = lineText;
     this.#textarea.setSelectionRange(col, col);
-    this.#scroll.scrollTop = this.#offset(line) - 50;
+    // Ensure line is visible
+    const targetY = this.#offset(line);
+    this.#scroll.scrollTop = targetY - this.#scroll.clientHeight / 2;
   }
 
   #onKey(e) {
     const { line, col } = this.#cursor;
-    if (e.key === 'ArrowUp') { this.#setCursor(Math.max(0, line - 1), col); e.preventDefault(); }
-    else if (e.key === 'ArrowDown') { this.#setCursor(Math.min(this.#lines.length - 1, line + 1), col); e.preventDefault(); }
-    else if (e.key === 'ArrowLeft') { this.#setCursor(line, Math.max(0, col - 1)); e.preventDefault(); }
-    else if (e.key === 'ArrowRight') { this.#setCursor(line, Math.min(this.#lines[line].length, col + 1)); e.preventDefault(); }
-    else if (e.key === 'Backspace' && !this.#range) {
+    const key = e.key;
+    // Navigation
+    if (key === 'ArrowUp') {
+      e.preventDefault();
+      if (line > 0) this.#setCursor(line - 1, Math.min(col, (this.#lines[line-1]||'').length));
+    } else if (key === 'ArrowDown') {
+      e.preventDefault();
+      if (line < this.#lines.length - 1) this.#setCursor(line + 1, Math.min(col, (this.#lines[line+1]||'').length));
+    } else if (key === 'ArrowLeft') {
+      e.preventDefault();
+      this.#setCursor(line, Math.max(0, col - 1));
+    } else if (key === 'ArrowRight') {
+      e.preventDefault();
+      this.#setCursor(line, Math.min((this.#lines[line]||'').length, col + 1));
+    } else if (key === 'Backspace') {
+      e.preventDefault();
       if (col > 0) {
-        const cmd = new Delete(line, col - 1, 1);
-        cmd.orig = this.#lines[line].charAt(col - 1);
-        this.#apply(cmd);
+        const deleted = this.#lines[line].charAt(col - 1);
+        const cmd = new Delete(line, col - 1, deleted);
+        this.#applyCommand(cmd);
         this.#setCursor(line, col - 1);
       } else if (line > 0) {
+        // Merge with previous line
         const prevLen = this.#lines[line - 1].length;
-        const cmd = new Delete(line - 1, prevLen, 1); // merge lines
-        cmd.orig = '\n';
-        this.#apply(cmd);
+        const cmd = new Delete(line - 1, prevLen, '\n');
+        this.#applyCommand(cmd);
         this.#setCursor(line - 1, prevLen);
       }
+    } else if (key === 'Delete') {
       e.preventDefault();
-    } else if (e.key === 'Delete' && !this.#range) {
-      if (col < this.#lines[line].length) {
-        const cmd = new Delete(line, col, 1);
-        cmd.orig = this.#lines[line].charAt(col);
-        this.#apply(cmd);
+      if (col < (this.#lines[line]||'').length) {
+        const deleted = this.#lines[line].charAt(col);
+        const cmd = new Delete(line, col, deleted);
+        this.#applyCommand(cmd);
         this.#setCursor(line, col);
       } else if (line < this.#lines.length - 1) {
-        const cmd = new Delete(line, this.#lines[line].length, 1);
-        cmd.orig = '\n';
-        this.#apply(cmd);
+        // Merge next line
+        const cmd = new Delete(line, (this.#lines[line]||'').length, '\n');
+        this.#applyCommand(cmd);
         this.#setCursor(line, col);
       }
+    } else if (key === 'Enter') {
       e.preventDefault();
+      // Insert newline at cursor (split line)
+      const cmd = new Insert(line, col, '\n');
+      this.#applyCommand(cmd);
+      this.#setCursor(line + 1, 0);
+    } else if (key === 'z' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      this.#undo();
+    } else if (key === 'y' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      this.#redo();
     }
+    // All other typing is handled by the input event
   }
 
   #onInput(e) {
-    const text = e.target.value; // whole current line text after IME or typing
+    // This is triggered after a character insertion or IME composition
+    const newLineText = e.target.value; // textarea contains full line after edit
     const { line, col } = this.#cursor;
-    // Compute inserted text by diff (simplified: assume single character insert/delete for now)
-    // Production would track composition and range selection.
-    // Placeholder: just replace current line with textarea value.
-    if (text !== this.#lines[line]) {
-      const cmd = new Insert(line, 0, text);
-      this.#apply(cmd);
-      this.#setCursor(line, text.length);
+    // Determine what changed (simplistic: compare old line with new)
+    const oldLine = this.#lines[line] || '';
+    if (newLineText === oldLine) return;
+
+    // Detect inserted text (assuming single character insertion for now)
+    // In a full implementation we'd diff, but here we accept whole replacement.
+    // For v1 we treat as: delete old line and insert new line at same position.
+    // Actually, we need to preserve proper undo. We'll do a simple diff: if new line is longer, assume insertion at col.
+    if (newLineText.length > oldLine.length) {
+      const inserted = newLineText.slice(col, col + (newLineText.length - oldLine.length));
+      const cmd = new Insert(line, col, inserted);
+      this.#applyCommand(cmd);
+      this.#setCursor(line, col + inserted.length);
+    } else {
+      // Deletion
+      const deleted = oldLine.slice(col, col + (oldLine.length - newLineText.length));
+      const cmd = new Delete(line, col, deleted);
+      this.#applyCommand(cmd);
+      this.#setCursor(line, col);
     }
   }
 
-  #apply(cmd) {
-    const newText = cmd.apply(this.#doc.text);
+  #applyCommand(cmd) {
+    const oldText = this.#store.text(this.#doc.id);
+    const newText = cmd.apply(oldText);
+    // Update store and document lines
+    this.#store.save(this.#doc.id, newText);
     this.#doc.text = newText;
     this.#lines = newText.split('\n');
+    this.#heights = new Array(this.#lines.length).fill(24); // heights reset (will be measured later)
     this.#history.push(cmd);
-    this.#store.dispatch('doc', { id: this.#doc.id, text: newText });
     this.#render();
   }
-}
 
-// ----- Other Components (Head, List, View, Foot) -----
-// Placeholder classes with minimal functionality
-
-class Head {
-  constructor(store, container) {
-    this.store = store;
-    this.el = container;
-    this.render();
-    store.subscribe(() => this.render());
+  #undo() {
+    const cmd = this.#history.undo();
+    if (!cmd) return;
+    const oldText = this.#store.text(this.#doc.id);
+    const newText = cmd.undo(oldText);
+    this.#store.save(this.#doc.id, newText);
+    this.#doc.text = newText;
+    this.#lines = newText.split('\n');
+    this.#heights = new Array(this.#lines.length).fill(24);
+    this.#render();
+    // Adjust cursor (simplified: go to start of affected line)
+    this.#setCursor(cmd.line, Math.min(this.#cursor.col, (this.#lines[cmd.line]||'').length));
   }
-  render() {
-    const tabs = this.store.tabs;
-    const active = this.store.active;
-    this.el.innerHTML = `
-      <div class="tabs">${tabs.map(id => `<span class="tab ${id === active ? 'active' : ''}">${id}</span>`).join('')}</div>
-      <div class="actions">
-        <button id="new">New</button>
-        <button id="open">Open</button>
-        <button id="export">Export</button>
-        <button id="import">Import</button>
-        <button id="theme">Theme</button>
-      </div>`;
-    document.getElementById('theme')?.addEventListener('click', () => {
-      const next = this.store.theme === 'dark' ? 'light' : 'dark';
-      this.store.dispatch('theme', next);
-    });
+
+  #redo() {
+    const cmd = this.#history.redo();
+    if (!cmd) return;
+    const oldText = this.#store.text(this.#doc.id);
+    const newText = cmd.apply(oldText);
+    this.#store.save(this.#doc.id, newText);
+    this.#doc.text = newText;
+    this.#lines = newText.split('\n');
+    this.#heights = new Array(this.#lines.length).fill(24);
+    this.#render();
+    this.#setCursor(cmd.line, Math.min(this.#cursor.col, (this.#lines[cmd.line]||'').length));
   }
 }
 
-class List {
-  constructor(store, container) {
-    this.store = store;
-    this.el = container;
-    this.render();
-    store.subscribe(() => this.render());
-  }
-  render() {
-    const docs = this.store.docs;
-    this.el.innerHTML = docs.map(d => `<div class="file" data-id="${d.id}">${d.name} (${d.mode})</div>`).join('');
-    this.el.querySelectorAll('.file').forEach(el => {
-      el.addEventListener('click', () => this.store.dispatch('active', el.dataset.id));
-    });
-  }
-}
-
+// ---------- View (preview pane) ----------
 class View {
-  constructor(store, container) {
+  constructor(store, iframe) {
     this.store = store;
-    this.iframe = container;
+    this.iframe = iframe;
     store.subscribe((action) => {
       if (action === 'active' || action === 'docs') this.update();
     });
+    this.update();
   }
+
   update() {
     const id = this.store.active;
     if (!id) return;
     const doc = this.store.docs.find(d => d.id === id);
     if (!doc) return;
+    const text = this.store.text(id);
     const plugin = plug[doc.mode] || plug.txt;
-    const html = plugin.render(doc.text);
+    const html = plugin.render(text);
     this.iframe.srcdoc = html;
   }
 }
 
+// ---------- Foot (status bar) ----------
 class Foot {
-  constructor(store, container) {
+  constructor(store, el) {
     this.store = store;
-    this.el = container;
-    this.render();
+    this.el = el;
     store.subscribe(() => this.render());
+    this.render();
   }
+
   render() {
-    this.el.textContent = `v1 Editor | Mode: ${this.store.active ? this.store.docs.find(d => d.id === this.store.active)?.mode : '-'}`;
+    const mode = this.store.active
+      ? (this.store.docs.find(d => d.id === this.store.active)?.mode || 'txt')
+      : '-';
+    this.el.textContent = `v1 Editor | Mode: ${mode} | Lines: ?`; // line/col will be added later
   }
 }
 
-// ----- Boot sequence -----
+// ---------- Boot ----------
 (async () => {
   // Register service worker
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('/worker.js');
+    try {
+      await navigator.serviceWorker.register('/worker.js');
+    } catch (err) {
+      console.warn('Service worker registration failed:', err);
+    }
   }
 
-  // Fetch SDUI payload and build DOM
+  // Load SDUI and build DOM
   const ui = await load('/ui.json');
-  document.body.prepend(build(ui));
+  const frag = build(ui);
+  document.body.append(frag);
 
   // Initialise store
   const store = new Store();
   store.load();
 
-  // Instantiate components
-  new Head(store, document.getElementById('head'));
-  new List(store, document.getElementById('list'));
-  const editContainer = document.getElementById('edit');
-  new Edit(store, editContainer, editContainer.querySelector('.gutter'), editContainer.querySelector('.content'));
-  new View(store, document.getElementById('preview'));
-  new Foot(store, document.getElementById('foot'));
+  // Instantiate components using structural selectors
+  new Head(store, document.querySelector('body > header'));
+  new List(store, document.querySelector('body > aside:first-of-type'));
+  new Edit(store, document.querySelector('body > main'));
+  new View(store, document.querySelector('body > aside:last-of-type > iframe'));
+  new Foot(store, document.querySelector('body > footer'));
 })();
