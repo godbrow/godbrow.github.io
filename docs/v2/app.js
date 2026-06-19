@@ -1,26 +1,42 @@
 
 /* =========================================================
-   TRANSACTION ENGINE CORE (v9)
+   SDUI + TRANSACTION EDITOR CORE (v10)
+   - deterministic UI contract
+   - transaction engine preserved
+   - stable editor binding
 ========================================================= */
 
 /* =========================================================
-   DOCUMENT STATE
+   GLOBAL UI CONTRACT
+========================================================= */
+
+const UI = {
+  editorPanel: null,
+  previewPanel: null
+};
+
+/* =========================================================
+   DOCUMENT MODEL
 ========================================================= */
 
 const DocumentModel = {
   blocks: [],
-
-  set(blocks) {
-    this.blocks = blocks;
-  },
-
-  get() {
-    return this.blocks;
-  }
+  set(b) { this.blocks = b; },
+  get() { return this.blocks; }
 };
 
 /* =========================================================
-   TRANSACTION TYPES
+   BLOCK FACTORY
+========================================================= */
+
+let globalId = 0;
+
+function createBlock(type = "paragraph", text = "") {
+  return { id: globalId++, type, text };
+}
+
+/* =========================================================
+   TRANSACTIONS
 ========================================================= */
 
 const TX = {
@@ -29,13 +45,11 @@ const TX = {
   MERGE: "merge"
 };
 
-/* =========================================================
-   TRANSACTION ENGINE
-========================================================= */
-
 const TransactionEngine = {
 
   apply(tx) {
+
+    const blocks = DocumentModel.get();
 
     switch (tx.type) {
 
@@ -54,10 +68,8 @@ const TransactionEngine = {
 
         const newBlock = createBlock("paragraph", after);
 
-        const arr = DocumentModel.get();
-        const idx = arr.indexOf(block);
-
-        arr.splice(idx + 1, 0, newBlock);
+        const idx = blocks.indexOf(block);
+        blocks.splice(idx + 1, 0, newBlock);
 
         tx.result = newBlock;
         break;
@@ -66,16 +78,14 @@ const TransactionEngine = {
       case TX.MERGE: {
         const { block } = tx;
 
-        const arr = DocumentModel.get();
-        const idx = arr.indexOf(block);
-
+        const idx = blocks.indexOf(block);
         if (idx === 0) return;
 
-        const prev = arr[idx - 1];
+        const prev = blocks[idx - 1];
 
         prev.text += block.text;
 
-        arr.splice(idx, 1);
+        blocks.splice(idx, 1);
 
         tx.result = prev;
         break;
@@ -83,20 +93,6 @@ const TransactionEngine = {
     }
   }
 };
-
-/* =========================================================
-   BLOCK FACTORY
-========================================================= */
-
-let globalId = 0;
-
-function createBlock(type = "paragraph", text = "") {
-  return {
-    id: globalId++,
-    type,
-    text
-  };
-}
 
 /* =========================================================
    STATE
@@ -109,7 +105,7 @@ const BlockCache = new Map();
 let activeBlockId = null;
 
 /* =========================================================
-   SCHEDULING (STABLE)
+   SCHEDULING
 ========================================================= */
 
 let editorQueued = false;
@@ -138,7 +134,7 @@ function queuePreviewRender() {
 }
 
 /* =========================================================
-   CURSOR STATE
+   CURSOR
 ========================================================= */
 
 const Cursor = {
@@ -152,7 +148,6 @@ function saveCursor(el, block) {
 }
 
 function restoreCursor() {
-
   requestAnimationFrame(() => {
 
     const el = editorPanel.querySelector(
@@ -170,10 +165,55 @@ function restoreCursor() {
 }
 
 /* =========================================================
-   EDITOR ELEMENT
+   SDUI BUILDER (FIXED CONTRACT)
 ========================================================= */
 
-function createEditorBlock(block) {
+async function loadUI() {
+
+  const res = await fetch("./ui.json");
+  const schema = await res.json();
+
+  buildUI(schema, document.body);
+
+  // CONTRACT RESOLUTION STEP
+  UI.editorPanel = document.querySelector('[role="editor-panel"]');
+  UI.previewPanel = document.querySelector('[role="preview-panel"]');
+
+  if (!UI.editorPanel || !UI.previewPanel) {
+    throw new Error("UI CONTRACT FAILED: missing panels");
+  }
+}
+
+function buildUI(node, parent) {
+
+  switch (node.type) {
+
+    case "page":
+      node.children?.forEach(c => buildUI(c, parent));
+      break;
+
+    case "main":
+      const main = document.querySelector("main") || parent;
+      node.children?.forEach(c => buildUI(c, main));
+      break;
+
+    case "section":
+      const el = document.createElement("section");
+
+      if (node.role) {
+        el.setAttribute("role", node.role);
+      }
+
+      parent.appendChild(el);
+      break;
+  }
+}
+
+/* =========================================================
+   BLOCK ELEMENTS
+========================================================= */
+
+function createBlockElement(block) {
 
   const el = document.createElement("div");
 
@@ -210,7 +250,7 @@ function createEditorBlock(block) {
 }
 
 /* =========================================================
-   RENDER EDITOR (NO DIRECT MUTATION)
+   EDITOR RENDER
 ========================================================= */
 
 function renderEditor() {
@@ -227,7 +267,7 @@ function renderEditor() {
     let el = BlockCache.get(block.id);
 
     if (!el) {
-      el = createEditorBlock(block);
+      el = createBlockElement(block);
       BlockCache.set(block.id, el);
     }
 
@@ -249,7 +289,7 @@ function renderEditor() {
 }
 
 /* =========================================================
-   KEY HANDLER (TRANSACTION BASED)
+   KEY HANDLER
 ========================================================= */
 
 function handleKey(e, el, block) {
@@ -295,30 +335,12 @@ function handleKey(e, el, block) {
       Cursor.offset = tx.result.text.length;
       restoreCursor();
     }
-
-    return;
   }
 }
 
 /* =========================================================
    PREVIEW
 ========================================================= */
-
-function renderPreview() {
-
-  if (!previewPanel) return;
-
-  const blocks = DocumentModel.get();
-
-  previewPanel.innerHTML = "";
-
-  for (const b of blocks) {
-    const el = document.createElement("div");
-    el.dataset.id = b.id;
-    el.innerHTML = renderMarkdown(b.text);
-    previewPanel.appendChild(el);
-  }
-}
 
 function renderMarkdown(text) {
   if (!text) return "";
@@ -330,19 +352,31 @@ function renderMarkdown(text) {
     .replace(/\*(.*?)\*/g, "<i>$1</i>");
 }
 
+function renderPreview() {
+
+  if (!UI.previewPanel) return;
+
+  const blocks = DocumentModel.get();
+
+  UI.previewPanel.innerHTML = "";
+
+  for (const b of blocks) {
+    const el = document.createElement("div");
+    el.innerHTML = renderMarkdown(b.text);
+    UI.previewPanel.appendChild(el);
+  }
+}
+
 /* =========================================================
    INIT
 ========================================================= */
 
-function init() {
+async function init() {
 
-  editorPanel = document.querySelector('[role="editor-panel"]');
-  previewPanel = document.querySelector('[role="preview-panel"]');
+  await loadUI();
 
-  if (!editorPanel || !previewPanel) {
-    console.error("Missing editor panels");
-    return;
-  }
+  editorPanel = UI.editorPanel;
+  previewPanel = UI.previewPanel;
 
   DocumentModel.set([
     createBlock("paragraph", "")
