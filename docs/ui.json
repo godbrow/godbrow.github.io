@@ -1,0 +1,49 @@
+{
+  "tag": "div",
+  "attrs": { "id": "app" },
+  "children": [
+    {
+      "tag": "header",
+      "attrs": { "id": "head" },
+      "children": [
+        { "tag": "div", "attrs": { "class": "tabs" } },
+        { "tag": "div", "attrs": { "class": "actions" } }
+      ]
+    },
+    {
+      "tag": "div",
+      "attrs": { "id": "main-row" },
+      "children": [
+        {
+          "tag": "aside",
+          "attrs": { "id": "list" }
+        },
+        {
+          "tag": "main",
+          "attrs": { "id": "edit" },
+          "children": [
+            { "tag": "div", "attrs": { "class": "gutter" } },
+            { "tag": "div", "attrs": { "class": "content" } }
+          ]
+        },
+        {
+          "tag": "aside",
+          "attrs": { "id": "view" },
+          "children": [
+            {
+              "tag": "iframe",
+              "attrs": {
+                "id": "preview",
+                "sandbox": "allow-same-origin"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "tag": "footer",
+      "attrs": { "id": "foot" }
+    }
+  ]
+}
