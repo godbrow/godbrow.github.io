@@ -356,18 +356,22 @@ class List {
 }
 
 // ---------- Edit (virtualised editor) ----------
+// ---------- Edit (virtualised editor, fixed input) ----------
 class Edit {
   #store;
-  #doc;          // current document object from store
-  #lines;        // array of line strings
-  #heights;      // measured line heights (default 24px)
-  #scroll;       // the .content element (scroll container)
-  #gutter;       // the .gutter element
-  #textarea;     // hidden textarea for input
-  #history;      // History instance
-  #parser;       // { plugin, ctx } for current mode
-  #cursor;       // { line, col } (collapsed)
-  #pool;         // array of currently visible .line elements
+  #doc;
+  #lines;
+  #heights;
+  #scroll;
+  #gutter;
+  #textarea;
+  #history;
+  #parser;
+  #cursor;
+  #pool;
+  #sentinel;
+  #composing = false;
+  #composeStartText = '';
 
   constructor(store, main) {
     this.#store = store;
@@ -381,24 +385,36 @@ class Edit {
     this.#cursor = { line: 0, col: 0 };
     this.#history = new History();
 
-    // Sentinel div for total height
-    const sentinel = document.createElement('div');
-    sentinel.className = 'sentinel';
-    this.#scroll.appendChild(sentinel);
-    this.sentinel = sentinel;
+    this.#sentinel = document.createElement('div');
+    this.#sentinel.className = 'sentinel';
+    this.#scroll.appendChild(this.#sentinel);
 
-    // Events
     this.#scroll.addEventListener('scroll', () => this.#render());
     this.#scroll.addEventListener('mousedown', (e) => this.#onMouseDown(e));
     this.#textarea.addEventListener('keydown', (e) => this.#onKey(e));
-    this.#textarea.addEventListener('input', (e) => this.#onInput(e));
-    // IME composition events (placeholder)
-    this.#textarea.addEventListener('compositionstart', () => {});
+    // IME composition
+    this.#textarea.addEventListener('compositionstart', () => {
+      this.#composing = true;
+      this.#composeStartText = this.#lines[this.#cursor.line] || '';
+    });
     this.#textarea.addEventListener('compositionend', (e) => {
-      this.#onInput({ target: { value: e.data || '' } });
+      this.#composing = false;
+      const composed = e.data || '';
+      const { line, col } = this.#cursor;
+      const oldLine = this.#composeStartText;
+      // Build a command that transforms oldLine into the composed text
+      // Approach: delete the whole line, then insert the new content at col
+      // For simplicity, we replace the entire line with the composed text.
+      if (composed !== oldLine) {
+        // Delete the entire old line, then insert the new one
+        const delCmd = new Delete(line, 0, oldLine);
+        this.#applyCommand(delCmd);
+        const insCmd = new Insert(line, 0, composed);
+        this.#applyCommand(insCmd);
+        this.#setCursor(line, composed.length);
+      }
     });
 
-    // React to store changes
     store.subscribe((action) => {
       if (action === 'active' || action === 'docs') this.refresh();
     });
@@ -406,7 +422,7 @@ class Edit {
 
   #makeTextarea() {
     const ta = document.createElement('textarea');
-    ta.style.cssText = 'position:absolute;opacity:0;pointer-events:none;width:1px;height:1px;left:0;top:0;';
+    ta.style.cssText = 'position:absolute;opacity:0;pointer-events:none;width:1px;height:1px;left:0;top:0;z-index:1;';
     return ta;
   }
 
@@ -435,7 +451,6 @@ class Edit {
   }
 
   #render() {
-    // Determine visible range based on scroll
     const scrollTop = this.#scroll.scrollTop;
     const viewHeight = this.#scroll.clientHeight;
     let start = 0, end = 0, acc = 0;
@@ -458,11 +473,10 @@ class Edit {
       if (i === this.#lines.length - 1) end = i;
     }
 
-    // Remove old lines (simple re‑creation instead of recycling for clarity)
     this.#clearPool();
     const frag = document.createDocumentFragment();
-    // Create gutter numbers
     const gutterFrag = document.createDocumentFragment();
+
     for (let i = start; i <= end; i++) {
       const lineNum = document.createElement('div');
       lineNum.textContent = i + 1;
@@ -473,28 +487,25 @@ class Edit {
     this.#gutter.innerHTML = '';
     this.#gutter.appendChild(gutterFrag);
 
-    // Create line elements
     for (let i = start; i <= end; i++) {
       const lineEl = document.createElement('div');
       lineEl.className = 'line';
       lineEl.style.top = `${this.#offset(i)}px`;
       lineEl.dataset.line = i;
 
-      // Block class
       const blockKind = this.#detectBlockKind(i);
       if (blockKind) lineEl.classList.add(blockKind);
 
-      // Number span
       const numSpan = document.createElement('span');
       numSpan.className = 'num';
       numSpan.textContent = i + 1;
-      // Text span with tokens
+
       const textSpan = document.createElement('span');
       textSpan.className = 'text';
       const tokens = this.#tokenizeLine(i);
       tokens.forEach(tok => {
         const span = document.createElement('span');
-        span.className = tok.kind;  // e.g., keyword, string, marker, text
+        span.className = tok.kind;
         span.textContent = tok.span;
         textSpan.appendChild(span);
       });
@@ -506,10 +517,7 @@ class Edit {
     }
 
     this.#scroll.appendChild(frag);
-
-    // Update sentinel height
-    const total = this.#offset(this.#lines.length);
-    this.sentinel.style.height = `${total}px`;
+    this.#sentinel.style.height = `${this.#offset(this.#lines.length)}px`;
   }
 
   #offset(untilLine) {
@@ -518,41 +526,30 @@ class Edit {
     return o;
   }
 
-  // Tokenize line using plugin, resetting ctx properly
   #tokenizeLine(lineIndex) {
-    // Reset parser context to start of document and iterate up to this line.
-    // Inefficient but safe for v1; in production we'd cache.
     const plugin = this.#parser.plugin;
     const ctx = plugin.start();
-    for (let i = 0; i < lineIndex; i++) {
-      plugin.line(this.#lines[i], ctx);
-    }
+    for (let i = 0; i < lineIndex; i++) plugin.line(this.#lines[i], ctx);
     return plugin.line(this.#lines[lineIndex], ctx);
   }
 
-  // Determine block class by checking line content (simplified)
   #detectBlockKind(lineIndex) {
-    const line = this.#lines[lineIndex];
-    if (!line) return 'para';
-    // Fenced code block detection requires state, but for simplicity we check first char
+    const line = this.#lines[lineIndex] || '';
     if (/^```/.test(line)) return 'codeblock';
-    // Check previous line’s fence state? Not easily, so we keep it simple.
     if (/^#{1,6}\s/.test(line)) return 'heading';
     if (/^\s*[-*+]\s/.test(line)) return 'list-block';
     if (/^>\s/.test(line)) return 'quote';
     return 'para';
   }
 
-  // Event handlers
   #onMouseDown(e) {
     const lineEl = e.target.closest('.line');
     if (!lineEl) return;
     const line = parseInt(lineEl.dataset.line, 10);
-    // Estimate column based on x relative to text span
     const textSpan = lineEl.querySelector('.text');
     if (!textSpan) return;
     const rect = textSpan.getBoundingClientRect();
-    const charWidth = 9.6; // approx monospace width
+    const charWidth = 9.6;
     const col = Math.max(0, Math.round((e.clientX - rect.left) / charWidth));
     this.#setCursor(line, col);
     this.#textarea.focus();
@@ -560,32 +557,51 @@ class Edit {
 
   #setCursor(line, col) {
     this.#cursor = { line, col };
-    // Update hidden textarea content to current line
     const lineText = this.#lines[line] || '';
     this.#textarea.value = lineText;
     this.#textarea.setSelectionRange(col, col);
-    // Ensure line is visible
     const targetY = this.#offset(line);
     this.#scroll.scrollTop = targetY - this.#scroll.clientHeight / 2;
   }
 
   #onKey(e) {
+    if (this.#composing) return; // let IME handle everything
+
     const { line, col } = this.#cursor;
     const key = e.key;
-    // Navigation
+
+    // Navigation keys
     if (key === 'ArrowUp') {
       e.preventDefault();
-      if (line > 0) this.#setCursor(line - 1, Math.min(col, (this.#lines[line-1]||'').length));
-    } else if (key === 'ArrowDown') {
+      if (line > 0) this.#setCursor(line - 1, Math.min(col, (this.#lines[line-1] || '').length));
+      return;
+    }
+    if (key === 'ArrowDown') {
       e.preventDefault();
-      if (line < this.#lines.length - 1) this.#setCursor(line + 1, Math.min(col, (this.#lines[line+1]||'').length));
-    } else if (key === 'ArrowLeft') {
+      if (line < this.#lines.length - 1) this.#setCursor(line + 1, Math.min(col, (this.#lines[line+1] || '').length));
+      return;
+    }
+    if (key === 'ArrowLeft') {
       e.preventDefault();
       this.#setCursor(line, Math.max(0, col - 1));
-    } else if (key === 'ArrowRight') {
+      return;
+    }
+    if (key === 'ArrowRight') {
       e.preventDefault();
-      this.#setCursor(line, Math.min((this.#lines[line]||'').length, col + 1));
-    } else if (key === 'Backspace') {
+      this.#setCursor(line, Math.min((this.#lines[line] || '').length, col + 1));
+      return;
+    }
+    if (key === 'Home') {
+      e.preventDefault();
+      this.#setCursor(line, 0);
+      return;
+    }
+    if (key === 'End') {
+      e.preventDefault();
+      this.#setCursor(line, (this.#lines[line] || '').length);
+      return;
+    }
+    if (key === 'Backspace') {
       e.preventDefault();
       if (col > 0) {
         const deleted = this.#lines[line].charAt(col - 1);
@@ -593,75 +609,62 @@ class Edit {
         this.#applyCommand(cmd);
         this.#setCursor(line, col - 1);
       } else if (line > 0) {
-        // Merge with previous line
         const prevLen = this.#lines[line - 1].length;
         const cmd = new Delete(line - 1, prevLen, '\n');
         this.#applyCommand(cmd);
         this.#setCursor(line - 1, prevLen);
       }
-    } else if (key === 'Delete') {
+      return;
+    }
+    if (key === 'Delete') {
       e.preventDefault();
-      if (col < (this.#lines[line]||'').length) {
+      if (col < (this.#lines[line] || '').length) {
         const deleted = this.#lines[line].charAt(col);
         const cmd = new Delete(line, col, deleted);
         this.#applyCommand(cmd);
         this.#setCursor(line, col);
       } else if (line < this.#lines.length - 1) {
-        // Merge next line
-        const cmd = new Delete(line, (this.#lines[line]||'').length, '\n');
+        const cmd = new Delete(line, (this.#lines[line] || '').length, '\n');
         this.#applyCommand(cmd);
         this.#setCursor(line, col);
       }
-    } else if (key === 'Enter') {
+      return;
+    }
+    if (key === 'Enter') {
       e.preventDefault();
-      // Insert newline at cursor (split line)
       const cmd = new Insert(line, col, '\n');
       this.#applyCommand(cmd);
       this.#setCursor(line + 1, 0);
-    } else if (key === 'z' && (e.ctrlKey || e.metaKey)) {
+      return;
+    }
+    // Undo/Redo
+    if (key === 'z' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
       this.#undo();
-    } else if (key === 'y' && (e.ctrlKey || e.metaKey)) {
+      return;
+    }
+    if (key === 'y' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
       this.#redo();
+      return;
     }
-    // All other typing is handled by the input event
-  }
 
-  #onInput(e) {
-    // This is triggered after a character insertion or IME composition
-    const newLineText = e.target.value; // textarea contains full line after edit
-    const { line, col } = this.#cursor;
-    // Determine what changed (simplistic: compare old line with new)
-    const oldLine = this.#lines[line] || '';
-    if (newLineText === oldLine) return;
-
-    // Detect inserted text (assuming single character insertion for now)
-    // In a full implementation we'd diff, but here we accept whole replacement.
-    // For v1 we treat as: delete old line and insert new line at same position.
-    // Actually, we need to preserve proper undo. We'll do a simple diff: if new line is longer, assume insertion at col.
-    if (newLineText.length > oldLine.length) {
-      const inserted = newLineText.slice(col, col + (newLineText.length - oldLine.length));
-      const cmd = new Insert(line, col, inserted);
+    // Printable characters (length === 1 and no modifier)
+    if (key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      e.preventDefault();
+      const cmd = new Insert(line, col, key);
       this.#applyCommand(cmd);
-      this.#setCursor(line, col + inserted.length);
-    } else {
-      // Deletion
-      const deleted = oldLine.slice(col, col + (oldLine.length - newLineText.length));
-      const cmd = new Delete(line, col, deleted);
-      this.#applyCommand(cmd);
-      this.#setCursor(line, col);
+      this.#setCursor(line, col + 1);
     }
   }
 
   #applyCommand(cmd) {
     const oldText = this.#store.text(this.#doc.id);
     const newText = cmd.apply(oldText);
-    // Update store and document lines
     this.#store.save(this.#doc.id, newText);
     this.#doc.text = newText;
     this.#lines = newText.split('\n');
-    this.#heights = new Array(this.#lines.length).fill(24); // heights reset (will be measured later)
+    this.#heights = new Array(this.#lines.length).fill(24);
     this.#history.push(cmd);
     this.#render();
   }
@@ -676,8 +679,7 @@ class Edit {
     this.#lines = newText.split('\n');
     this.#heights = new Array(this.#lines.length).fill(24);
     this.#render();
-    // Adjust cursor (simplified: go to start of affected line)
-    this.#setCursor(cmd.line, Math.min(this.#cursor.col, (this.#lines[cmd.line]||'').length));
+    this.#setCursor(cmd.line, Math.min(this.#cursor.col, (this.#lines[cmd.line] || '').length));
   }
 
   #redo() {
@@ -690,10 +692,9 @@ class Edit {
     this.#lines = newText.split('\n');
     this.#heights = new Array(this.#lines.length).fill(24);
     this.#render();
-    this.#setCursor(cmd.line, Math.min(this.#cursor.col, (this.#lines[cmd.line]||'').length));
+    this.#setCursor(cmd.line, Math.min(this.#cursor.col, (this.#lines[cmd.line] || '').length));
   }
 }
-
 // ---------- View (preview pane) ----------
 class View {
   constructor(store, iframe) {
