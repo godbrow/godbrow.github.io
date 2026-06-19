@@ -216,15 +216,18 @@ class Store {
         this.#state.theme = data;
         document.documentElement.classList.toggle('dark', data === 'dark');
         break;
-case 'doc': {
-  const { id, text } = data;
-  const doc = this.#state.docs.find(d => d.id === id);
-  if (doc) doc.text = text;
-  this.#notify('doc');   // <-- crucial: tell components the text changed
-  break;
-}
+      case 'doc': {
+        const { id, text } = data;
+        const doc = this.#state.docs.find(d => d.id === id);
+        if (doc) doc.text = text;
+        break;
+      }
     }
     this.#persist(action);
+    this.#notify(action);               // 👈 this is now correctly defined
+  }
+
+  #notify(action) {
     this.#subs.forEach(fn => fn(action, this.#state));
   }
 
@@ -252,11 +255,10 @@ case 'doc': {
     document.documentElement.classList.toggle('dark', theme === 'dark');
   }
 
-  // Convenience: get full text for a document id
+  // Convenience helpers
   text(id) {
     return localStorage.getItem(`doc:${id}`) || '';
   }
-  // Save text to localStorage
   save(id, text) {
     localStorage.setItem(`doc:${id}`, text);
   }
