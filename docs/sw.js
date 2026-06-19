@@ -1,4 +1,15 @@
-const CACHE = "md-editor-cache-v1";
+/* =========================================================
+   Vanilla Markdown Lab — sw.js
+   Simple offline-first cache layer (App Shell strategy)
+========================================================= */
+
+const CACHE_NAME = "vml-cache-v1";
+
+/*
+  Core assets to cache.
+  Keep this SMALL and stable.
+  Only include essential shell files.
+*/
 const ASSETS = [
   "./",
   "./index.html",
@@ -6,51 +17,80 @@ const ASSETS = [
   "./app.js"
 ];
 
+/* -----------------------------
+   Install event
+   - pre-cache app shell
+----------------------------- */
+
 self.addEventListener("install", (event) => {
-  event.waitUntil((async () => {
-    const cache = await caches.open(CACHE);
-    await cache.addAll(ASSETS);
-    self.skipWaiting();
-  })());
+  event.waitUntil(
+    caches.open(CACHE_NAME).then((cache) => {
+      return cache.addAll(ASSETS);
+    })
+  );
+
+  // force immediate activation
+  self.skipWaiting();
 });
 
+/* -----------------------------
+   Activate event
+   - cleanup old caches
+----------------------------- */
+
 self.addEventListener("activate", (event) => {
-  event.waitUntil((async () => {
-    const keys = await caches.keys();
-    await Promise.all(keys.map((k) => (k === CACHE ? null : caches.delete(k))));
-    self.clients.claim();
-  })());
+  event.waitUntil(
+    caches.keys().then((keys) => {
+      return Promise.all(
+        keys.map((key) => {
+          if (key !== CACHE_NAME) {
+            return caches.delete(key);
+          }
+        })
+      );
+    })
+  );
+
+  self.clients.claim();
 });
+
+/* -----------------------------
+   Fetch strategy
+   - cache-first for app shell
+   - network fallback for freshness
+----------------------------- */
 
 self.addEventListener("fetch", (event) => {
   const req = event.request;
+
+  // Only handle GET requests
   if (req.method !== "GET") return;
 
-  event.respondWith((async () => {
-    const url = new URL(req.url);
-
-    // Cache-first for same-origin assets; network fallback for others
-    if (url.origin === location.origin) {
-      const cache = await caches.open(CACHE);
-      const cached = await cache.match(req);
+  event.respondWith(
+    caches.match(req).then((cached) => {
       if (cached) return cached;
 
-      try {
-        const res = await fetch(req);
-        // Only cache successful responses
-        if (res && res.ok) cache.put(req, res.clone());
-        return res;
-      } catch {
-        // If we can't fetch, try to fall back to cached index.html for navigations
-        if (req.mode === "navigate" || req.headers.get("accept")?.includes("text/html")) {
-          const fallback = await cache.match("./index.html");
-          if (fallback) return fallback;
-        }
-        throw;
-      }
-    }
+      return fetch(req)
+        .then((res) => {
+          // clone response before caching
+          const copy = res.clone();
 
-    // Cross-origin: just network
-    return fetch(req);
-  })());
+          caches.open(CACHE_NAME).then((cache) => {
+            cache.put(req, copy);
+          });
+
+          return res;
+        })
+        .catch(() => {
+          // optional offline fallback behavior
+          // could return a custom offline page later
+          return new Response(
+            "Offline — content not available in cache.",
+            {
+              headers: { "Content-Type": "text/plain" }
+            }
+          );
+        });
+    })
+  );
 });
