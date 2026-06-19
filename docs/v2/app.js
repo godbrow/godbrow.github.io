@@ -368,29 +368,41 @@ function handleKey(e, el, block) {
     restoreCursor();
     return;
   }
+if (e.key === "Backspace") {
 
-  if (e.key === "Backspace") {
+  const pos = el.selectionStart ?? el.innerText.length;
 
-    if (pos === 0) {
-      e.preventDefault();
+  if (pos === 0) {
+    e.preventDefault();
 
-      const tx = {
-        type: EditorApp.TX.MERGE,
-        block
-      };
+    let tx = {
+      type: EditorApp.TX.MERGE,
+      block
+    };
 
-      TransactionEngine.apply(tx);
+    TransactionEngine.apply(tx);
 
-      queueEditorRender();
-      queuePreviewRender();
+    // 🔥 CHAIN COLLAPSE (important fix)
+    Normalizer.run();
 
-      if (tx.result) {
-        EditorApp.cursor.blockId = tx.result.id;
-        EditorApp.cursor.offset = tx.result.text.length;
-        restoreCursor();
-      }
+    queueEditorRender();
+    queuePreviewRender();
+
+    if (tx.result) {
+
+      EditorApp.cursor.blockId = tx.result.id;
+
+      // FIX: always force END of previous block
+      EditorApp.cursor.offset = tx.result.text.length;
+
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          restoreCursor();
+        });
+      });
     }
   }
+}
 }
 
 /* =========================================================
