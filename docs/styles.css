@@ -118,29 +118,33 @@ body > main {
   overflow-x: auto;
 }
 
-/* Contenteditable pre styling */
 pre.edit {
   font-family: var(--font-mono);
   color: var(--text);
   background: var(--bg);
-  padding: 0;
   caret-color: var(--text);
   tab-size: 2;
-  /* Ensure it fills the content area */
   width: 100%;
   min-height: 100%;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  margin: 0;
+  outline: none;
 }
 
-/* Section (line) */
 .section {
   display: block;
   min-height: var(--line-height);
   line-height: var(--line-height);
 }
 
-/* Line feed span – just holds the <br> */
 .lf {
   display: inline;
+}
+
+/* Optional: show focus glow */
+.content.focused {
+  box-shadow: inset 0 0 0 2px var(--keyword);
 }
 
 /* Gutter stays the same */
