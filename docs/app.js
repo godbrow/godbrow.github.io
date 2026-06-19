@@ -215,7 +215,7 @@ function renderMarkdown(src) {
   text = withoutBlocks;
 
   /* STRUCTURE PHASE */
-  text = renderBlocks(text);
+  // text = renderBlocks(text);
   
   // 3. structural markdown (still core-owned)
   text = text
