@@ -1,10 +1,9 @@
+
 /* =========================================================
-   SDUI Block Editor Kernel v5
-   - Block model (source of truth)
-   - Virtualized + DOM reuse editor
-   - Cursor-safe editing
-   - Plugin system with lifecycle
-   - Markdown plugin restored
+   SDUI Block Editor Kernel v6 (STABLE)
+   - Fixes typing corruption
+   - Safe rendering pipeline
+   - Plugin system preserved
 ========================================================= */
 
 /* =========================================================
@@ -38,7 +37,7 @@ function createBlock(type = "paragraph", text = "") {
 }
 
 /* =========================================================
-   INITIAL PARSER
+   PARSER
 ========================================================= */
 
 function parseToBlocks(text = "") {
@@ -131,7 +130,7 @@ function computeVisibleRange(blocks, scrollTop, viewportHeight) {
 }
 
 /* =========================================================
-   CURSOR STATE (CRITICAL FIX)
+   CURSOR STATE (SAFE VERSION)
 ========================================================= */
 
 const CursorState = {
@@ -144,22 +143,49 @@ function saveCursor(el, block) {
   CursorState.offset = el.selectionStart ?? el.innerText.length;
 }
 
-function restoreCursor() {
+function restoreCursor(editorPanel) {
+
   requestAnimationFrame(() => {
 
-    const { blockId, offset } = CursorState;
+    if (CursorState.blockId == null) return;
 
-    if (blockId == null) return;
-
-    const el = editorPanel.querySelector(`[data-id="${blockId}"]`);
+    const el = editorPanel.querySelector(
+      `[data-id="${CursorState.blockId}"]`
+    );
 
     if (!el) return;
 
     el.focus();
 
     try {
-      el.setSelectionRange?.(offset, offset);
+      el.setSelectionRange?.(
+        CursorState.offset,
+        CursorState.offset
+      );
     } catch {}
+  });
+}
+
+/* =========================================================
+   ACTIVE EDITING GUARD (CRITICAL FIX)
+========================================================= */
+
+let activeBlockId = null;
+
+/* =========================================================
+   RENDER DEBOUNCE (CRITICAL FIX)
+========================================================= */
+
+let renderQueued = false;
+
+function queueRender() {
+  if (renderQueued) return;
+
+  renderQueued = true;
+
+  requestAnimationFrame(() => {
+    renderQueued = false;
+    scheduleRender();
   });
 }
 
@@ -209,7 +235,7 @@ class PluginInstance {
 const PluginInstances = new Map();
 
 /* =========================================================
-   DOM CACHE (IMPORTANT OPTIMIZATION)
+   DOM CACHE (VIRTUALIZATION STABILITY)
 ========================================================= */
 
 const BlockDOMCache = new Map();
@@ -254,7 +280,7 @@ function renderNode(node, parent) {
 }
 
 /* =========================================================
-   PLUGINS RUNTIME
+   PLUGIN RUNTIME
 ========================================================= */
 
 function runPlugin(block, el) {
@@ -287,7 +313,7 @@ function cleanupPlugins(activeIds) {
 }
 
 /* =========================================================
-   EDITOR (VIRTUAL + DOM REUSE)
+   EDITOR (VIRTUAL + SAFE DOM REUSE)
 ========================================================= */
 
 function renderEditorVirtual() {
@@ -315,16 +341,25 @@ function renderEditorVirtual() {
       el.contentEditable = true;
       el.dataset.id = block.id;
 
+      el.addEventListener("focus", () => {
+        activeBlockId = block.id;
+      });
+
+      el.addEventListener("blur", () => {
+        activeBlockId = null;
+      });
+
       el.addEventListener("input", () => {
+
         saveCursor(el, block);
 
         block.text = el.innerText;
 
         syncPreviewBlock(block);
 
-        scheduleRender();
+        queueRender();
 
-        restoreCursor();
+        restoreCursor(editorPanel);
       });
 
       el.addEventListener("keydown", (e) => {
@@ -334,7 +369,10 @@ function renderEditorVirtual() {
       BlockDOMCache.set(block.id, el);
     }
 
-    el.innerText = block.text;
+    // IMPORTANT: do NOT overwrite active typing block
+    if (block.id !== activeBlockId) {
+      el.innerText = block.text;
+    }
 
     container.appendChild(el);
   }
@@ -348,7 +386,7 @@ function renderEditorVirtual() {
 }
 
 /* =========================================================
-   BLOCK EDITING (split / merge)
+   BLOCK EDITING
 ========================================================= */
 
 function splitBlock(block, cursorPos) {
@@ -396,7 +434,7 @@ function handleBlockEditing(e, el, block) {
     scheduleRender();
     renderPreview();
 
-    restoreCursor();
+    restoreCursor(editorPanel);
   }
 
   if (e.key === "Backspace" && cursorPos === 0) {
@@ -407,7 +445,7 @@ function handleBlockEditing(e, el, block) {
     scheduleRender();
     renderPreview();
 
-    if (prev) restoreCursor();
+    if (prev) restoreCursor(editorPanel);
   }
 }
 
@@ -472,7 +510,7 @@ function syncPreviewBlock(block) {
 }
 
 /* =========================================================
-   RENDER PIPELINE
+   PIPELINE
 ========================================================= */
 
 function scheduleRender() {
@@ -491,7 +529,7 @@ function scheduleRender() {
 }
 
 /* =========================================================
-   MARKDOWN PLUGIN (FIXED CORE ISSUE)
+   MARKDOWN PLUGIN (FIXED ROOT CAUSE)
 ========================================================= */
 
 function renderMarkdown(text) {
@@ -512,7 +550,6 @@ function renderMarkdown(text) {
 
 PluginRegistry.register({
   type: "paragraph",
-
   render(block) {
     return renderMarkdown(block.text);
   }
