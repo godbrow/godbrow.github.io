@@ -84,103 +84,123 @@ function attachScrollSync(editorEl, previewEl) {
    plugins will extend later
 ----------------------------- */
 
+const BlockRegistry = {
+  blocks: new Map(),
+
+  register(type, handler) {
+    this.blocks.set(type, handler);
+  },
+
+  has(type) {
+    return this.blocks.has(type);
+  },
+
+  get(type) {
+    return this.blocks.get(type);
+  }
+};
+
+function extractBlocks(text) {
+  const store = [];
+
+  text = text.replace(/```(\w+)?\n([\s\S]*?)```/g, (_, lang, code) => {
+    const type = lang || "text";
+
+    const handler = BlockRegistry.get(type);
+
+    const block = {
+      type,
+      content: code
+    };
+
+    if (handler) {
+      const html = handler(block);
+      const id = store.length;
+
+      store.push(html);
+      return `@@BLOCK_${id}@@`;
+    }
+
+    // fallback (no plugin registered)
+    const safe = escapeHtml(code);
+    const fallback = `<pre><code>${safe}</code></pre>`;
+
+    const id = store.length;
+    store.push(fallback);
+
+    return `@@BLOCK_${id}@@`;
+  });
+
+  return { text, store };
+}
+
+function renderInline(text) {
+  return text
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
+    .replace(/\*(.+?)\*/g, "<i>$1</i>")
+    .replace(/\$(.+?)\$/g, "<span class='math'>$1</span>")
+    .replace(
+      /\[([^\]]+)\]\((https?:\/\/[^\)]+)\)/g,
+      `<a href="$2" target="_blank" rel="noopener">$1</a>`
+    );
+}
+
 function renderMarkdown(src) {
+  // 1. escape early (safety baseline)
   let text = escapeHtml(src);
 
-  /* =====================================================
-     1. BLOCKS (structural elements first)
-  ===================================================== */
+  // 2. block extraction (registry-driven)
+  const { text: withoutBlocks, store } = extractBlocks(text);
 
-  // HEADINGS
+  text = withoutBlocks;
+
+  // 3. structural markdown (still core-owned)
   text = text
     .replace(/^###### (.*)$/gm, "<h6>$1</h6>")
     .replace(/^##### (.*)$/gm, "<h5>$1</h5>")
     .replace(/^#### (.*)$/gm, "<h4>$1</h4>")
     .replace(/^### (.*)$/gm, "<h3>$1</h3>")
     .replace(/^## (.*)$/gm, "<h2>$1</h2>")
-    .replace(/^# (.*)$/gm, "<h1>$1</h1>");
+    .replace(/^# (.*)$/gm, "<h1>$1</h1>")
+    .replace(/^> (.*)$/gm, "<blockquote>$1</blockquote>");
 
-  // BLOCKQUOTE
-  text = text.replace(/^> (.*)$/gm, "<blockquote>$1</blockquote>");
+  // 4. inline phase
+  text = renderInline(text);
 
-  // UNORDERED LISTS (simple grouped version)
+  // 5. restore blocks
+  text = text.replace(/@@BLOCK_(\d+)@@/g, (_, i) => store[i]);
+
+  // 6. lists (kept core for now)
   text = text.replace(
     /(?:^[-*] .*(\n|$))+?/gm,
     (match) => {
       const items = match
         .trim()
         .split("\n")
-        .map((line) => line.replace(/^[-*] /, ""))
-        .map((item) => `<li>${item}</li>`)
+        .map(l => l.replace(/^[-*] /, ""))
+        .map(i => `<li>${i}</li>`)
         .join("");
 
       return `<ul>${items}</ul>`;
     }
   );
 
-  // ORDERED LISTS
   text = text.replace(
     /(?:^\d+\. .*(\n|$))+?/gm,
     (match) => {
       const items = match
         .trim()
         .split("\n")
-        .map((line) => line.replace(/^\d+\. /, ""))
-        .map((item) => `<li>${item}</li>`)
+        .map(l => l.replace(/^\d+\. /, ""))
+        .map(i => `<li>${i}</li>`)
         .join("");
 
       return `<ol>${items}</ol>`;
     }
   );
 
-  /* =====================================================
-     2. INLINE ELEMENTS
-  ===================================================== */
-
-  // INLINE CODE
-  text = text.replace(/`([^`]+)`/g, "<code>$1</code>");
-
-  // BOLD
-  text = text.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
-
-  // ITALIC
-  text = text.replace(/\*(.+?)\*/g, "<i>$1</i>");
-
-  // LINKS [text](url)
-  text = text.replace(
-    /\[([^\]]+)\]\((https?:\/\/[^\)]+)\)/g,
-    `<a href="$2" target="_blank" rel="noopener">$1</a>`
-  );
-
-  // INLINE MATH
-  text = text.replace(/\$(.+?)\$/g, "<span class='math'>$1</span>");
-
-  /* =====================================================
-     3. CODE BLOCKS (last step to avoid interference)
-  ===================================================== */
-
-  const codeBlocks = [];
-
-  text = text.replace(/```(\w+)?\n([\s\S]*?)```/g, (_, lang, code) => {
-    const id = codeBlocks.length;
-    codeBlocks.push({ lang, code });
-    return `@@CODE${id}@@`;
-  });
-
-  text = text.replace(/@@CODE(\d+)@@/g, (_, i) => {
-    const { lang, code } = codeBlocks[i];
-
-    const safe = escapeHtml(code);
-
-    return `
-      <pre><code class="lang-${lang || "text"}">${safe}</code></pre>
-    `;
-  });
-
-  /* =====================================================
-     4. FINAL LINE HANDLING
-  ===================================================== */
-
+  // 7. final newline pass
   text = text.replace(/\n/g, "<br>");
 
   return text;
@@ -268,6 +288,13 @@ function init() {
 
   // scroll sync
   attachScrollSync(editor, preview);
+  BlockRegistry.register("js", (block) => {
+     const code = escapeHtml(block.content);
+     // very simple highlight (still core-safe)
+     const highlighted = code.replace(/\b(const|let|function|return|if|for)\b/g, "<span class='kw'>$1</span>");
+     return `<pre><code class="lang-js">${highlighted}</code></pre>`;
+     }
+  );
 }
 
 /* -----------------------------
