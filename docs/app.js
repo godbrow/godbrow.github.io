@@ -369,40 +369,68 @@ class List {
 
 // ---------- Edit (contenteditable pre, native cursor) ----------
 // ---------- Edit (contenteditable pre, native cursor) ----------
+// ---------- Edit (hidden textarea + virtualised, exact click) ----------
 class Edit {
-  #store; #doc; #lines; #heights; #scroll; #gutter; #pre;
-  #history; #parser; #cursor; #cursors;
-  #composing = false;
+  #store; #doc; #lines; #heights; #scroll; #gutter; #textarea;
+  #history; #parser; #cursor; #pool; #sentinel; #caret;
+  #focused = false; #composing = false; #composeStartText = '';
+  #cursors = new Map();   // per‑document cursor memory
 
   constructor(store, main) {
     this.#store = store;
     this.#gutter = main.querySelector('.gutter');
     this.#scroll = main.querySelector('.content');
-    this.#cursors = new Map();
+    this.#textarea = this.#makeTextarea();
+    this.#scroll.appendChild(this.#textarea);
+    this.#pool = [];
+    this.#heights = [];
+    this.#lines = [];
     this.#cursor = { line: 0, col: 0 };
     this.#history = new History();
+    this.#sentinel = document.createElement('div');
+    this.#sentinel.className = 'sentinel';
+    this.#scroll.appendChild(this.#sentinel);
 
-    // Create contenteditable pre
-    this.#pre = document.createElement('pre');
-    this.#pre.className = 'edit';
-    this.#pre.setAttribute('contenteditable', 'true');
-    this.#pre.setAttribute('spellcheck', 'false');
-    this.#pre.style.cssText = 'white-space:pre-wrap;word-wrap:break-word;margin:0;outline:none;min-height:100%;';
-    this.#scroll.appendChild(this.#pre);
+    // Blinking caret element
+    this.#caret = document.createElement('span');
+    this.#caret.className = 'caret';
+    this.#caret.style.cssText = 'position:absolute;width:2px;height:var(--line-height);background:var(--text);display:none;pointer-events:none;z-index:2;';
+    this.#scroll.appendChild(this.#caret);
 
-    this.#pre.addEventListener('keydown', (e) => this.#onKey(e));
-    this.#pre.addEventListener('input', (e) => this.#onInput(e));
-    this.#pre.addEventListener('compositionstart', () => { this.#composing = true; });
-    this.#pre.addEventListener('compositionend', (e) => {
-      this.#composing = false;
-      this.#onInput(e);
+    this.#scroll.addEventListener('scroll', () => this.#render());
+    this.#scroll.addEventListener('mousedown', (e) => this.#onMouseDown(e));
+    this.#textarea.addEventListener('keydown', (e) => this.#onKey(e));
+    this.#textarea.addEventListener('focus', () => { this.#focused = true; this.#showCaret(); });
+    this.#textarea.addEventListener('blur', () => { this.#focused = false; this.#hideCaret(); });
+
+    this.#textarea.addEventListener('compositionstart', () => {
+      this.#composing = true;
+      this.#composeStartText = this.#lines[this.#cursor.line] || '';
     });
-    this.#pre.addEventListener('focus', () => this.#scroll.classList.add('focused'));
-    this.#pre.addEventListener('blur', () => this.#scroll.classList.remove('focused'));
+    this.#textarea.addEventListener('compositionend', (e) => {
+      this.#composing = false;
+      const composed = e.data || '';
+      const { line, col } = this.#cursor;
+      const oldLine = this.#composeStartText;
+      if (composed !== oldLine) {
+        const startOff = this.#offsetFromLineCol(line, 0);
+        const del = new Delete(startOff, oldLine);
+        this.#applyCommand(del);
+        const ins = new Insert(startOff, composed);
+        this.#applyCommand(ins);
+        this.#setCursor(line, composed.length);
+      }
+    });
 
     store.subscribe((action) => {
       if (action === 'active' || action === 'docs') this.refresh();
     });
+  }
+
+  #makeTextarea() {
+    const ta = document.createElement('textarea');
+    ta.style.cssText = 'position:absolute;opacity:0;pointer-events:none;width:1px;height:1px;left:0;top:0;z-index:1;';
+    return ta;
   }
 
   refresh() {
@@ -413,12 +441,14 @@ class Edit {
     this.#doc = doc;
     const text = this.#store.text(id);
     this.#lines = text.split('\n');
+    this.#heights = new Array(this.#lines.length).fill(24);
     this.#history = new History();
     this.#parser = {
       plugin: plug[doc.mode] || plug.txt,
       ctx: (plug[doc.mode] || plug.txt).start()
     };
 
+    // Restore previous cursor
     const saved = this.#cursors.get(id);
     if (saved) {
       this.#cursor = { line: saved.line, col: saved.col };
@@ -430,46 +460,110 @@ class Edit {
     if (this.#cursor.col > (this.#lines[this.#cursor.line] || '').length)
       this.#cursor.col = (this.#lines[this.#cursor.line] || '').length;
 
-    this.#renderAll();
-    this.#restoreCursor();
-    this.#pre.focus();
+    this.#clearPool();
+    this.#render();
+    this.#setCursor(this.#cursor.line, this.#cursor.col);
+    this.#textarea.focus();
   }
 
-  #renderAll() {
-    const frag = document.createDocumentFragment();
+  #clearPool() {
+    this.#pool.forEach(el => el.remove());
+    this.#pool = [];
+  }
+
+  #render() {
+    const scrollTop = this.#scroll.scrollTop;
+    const viewHeight = this.#scroll.clientHeight;
+    let start = 0, end = 0, acc = 0;
     for (let i = 0; i < this.#lines.length; i++) {
-      const section = this.#renderLine(i);
-      frag.appendChild(section);
+      const h = this.#heights[i] || 24;
+      if (acc + h > scrollTop) { start = i; break; }
+      acc += h;
     }
-    this.#pre.innerHTML = '';
-    this.#pre.appendChild(frag);
+    acc = 0;
+    for (let i = start; i < this.#lines.length; i++) {
+      const h = this.#heights[i] || 24;
+      acc += h;
+      if (acc > viewHeight + 200) { end = i; break; }
+      if (i === this.#lines.length - 1) end = i;
+    }
+
+    this.#clearPool();
+    const frag = document.createDocumentFragment();
+    const gutterFrag = document.createDocumentFragment();
+
+    // Gutter numbers
+    for (let i = start; i <= end; i++) {
+      const lineNum = document.createElement('div');
+      lineNum.textContent = i + 1;
+      lineNum.style.height = `${this.#heights[i] || 24}px`;
+      lineNum.style.lineHeight = `${this.#heights[i] || 24}px`;
+      gutterFrag.appendChild(lineNum);
+    }
+    this.#gutter.innerHTML = '';
+    this.#gutter.appendChild(gutterFrag);
+
+    // Lines (no duplicate line numbers)
+    for (let i = start; i <= end; i++) {
+      const lineEl = document.createElement('div');
+      lineEl.className = 'line';
+      lineEl.style.top = `${this.#offset(i)}px`;
+      lineEl.dataset.line = i;
+
+      const blockKind = this.#detectBlockKind(i);
+      if (blockKind) lineEl.classList.add(blockKind);
+
+      const textSpan = document.createElement('span');
+      textSpan.className = 'text';
+      const tokens = this.#tokenizeLine(i);
+      tokens.forEach(tok => {
+        const span = document.createElement('span');
+        span.className = tok.kind;
+        span.textContent = tok.span;
+        textSpan.appendChild(span);
+      });
+
+      lineEl.appendChild(textSpan);   // only the text span
+      frag.appendChild(lineEl);
+      this.#pool.push(lineEl);
+    }
+
+    this.#scroll.appendChild(frag);
+    this.#sentinel.style.height = `${this.#offset(this.#lines.length)}px`;
+
+    if (this.#focused) this.#showCaret();
   }
 
-  #renderLine(lineIndex) {
-    const div = document.createElement('div');
-    div.className = 'section';
-    div.dataset.line = lineIndex;
+  #offset(untilLine) {
+    let o = 0;
+    for (let i = 0; i < untilLine; i++) o += this.#heights[i] || 24;
+    return o;
+  }
 
-    const blockKind = this.#detectBlockKind(lineIndex);
-    if (blockKind) div.classList.add(blockKind);
+  #offsetFromLineCol(line, col) {
+    let off = 0;
+    for (let i = 0; i < line; i++) off += this.#lines[i].length + 1;
+    off += col;
+    return off;
+  }
 
-    const tokens = this.#tokenizeLine(lineIndex);
-    const textSpan = document.createElement('span');
-    textSpan.className = 'text';
-    tokens.forEach(tok => {
-      const span = document.createElement('span');
-      span.className = tok.kind;
-      span.textContent = tok.span;
-      textSpan.appendChild(span);
-    });
-    div.appendChild(textSpan);
+  #lineColFromOffset(off) {
+    let l = 0, c = 0, acc = 0;
+    while (l < this.#lines.length) {
+      const lineLen = this.#lines[l].length;
+      if (acc + lineLen >= off) { c = off - acc; break; }
+      acc += lineLen + 1;
+      l++;
+    }
+    if (l >= this.#lines.length) { l = this.#lines.length - 1; c = this.#lines[l].length; }
+    return { line: l, col: Math.min(c, this.#lines[l].length) };
+  }
 
-    const lf = document.createElement('span');
-    lf.className = 'lf';
-    lf.innerHTML = '<br>';
-    div.appendChild(lf);
-
-    return div;
+  #tokenizeLine(lineIndex) {
+    const plugin = this.#parser.plugin;
+    const ctx = plugin.start();
+    for (let i = 0; i < lineIndex; i++) plugin.line(this.#lines[i], ctx);
+    return plugin.line(this.#lines[lineIndex], ctx);
   }
 
   #detectBlockKind(lineIndex) {
@@ -481,118 +575,247 @@ class Edit {
     return 'para';
   }
 
-  #tokenizeLine(lineIndex) {
-    const plugin = this.#parser.plugin;
-    const ctx = plugin.start();
-    for (let i = 0; i < lineIndex; i++) plugin.line(this.#lines[i], ctx);
-    return plugin.line(this.#lines[lineIndex], ctx);
-  }
+  // ---------- Precise click handling using browser API ----------
+  #onMouseDown(e) {
+    const lineEl = e.target.closest('.line');
+    if (!lineEl) return;
+    const line = parseInt(lineEl.dataset.line, 10);
 
-  #saveCursor() {
-    const sel = window.getSelection();
-    if (!sel.rangeCount) return;
-    const node = sel.anchorNode;
-    const section = node?.parentElement?.closest('.section');
-    if (!section) return;
-    const line = parseInt(section.dataset.line, 10);
-    const textSpan = section.querySelector('.text');
-    let col = 0;
-    if (textSpan) {
-      const walker = document.createTreeWalker(textSpan, NodeFilter.SHOW_TEXT);
-      let current = walker.nextNode();
-      while (current && current !== node) {
-        col += current.textContent.length;
-        current = walker.nextNode();
-      }
-      if (current === node) {
-        col += sel.anchorOffset;
+    // Use the browser's own text position detection (works for any font/zoom)
+    const caretPos = document.caretPositionFromPoint(e.clientX, e.clientY);
+    if (caretPos) {
+      let node = caretPos.offsetNode;
+      let offset = caretPos.offset;
+      // Walk up to find the .text span
+      const textSpan = lineEl.querySelector('.text');
+      if (textSpan) {
+        // Ensure we are inside the .text span (click might be on a token span)
+        while (node && node !== textSpan) {
+          node = node.parentNode;
+        }
+        if (node === textSpan) {
+          // Now count characters from the start of textSpan to the offset
+          const col = this.#columnFromNode(textSpan, caretPos.offsetNode, offset);
+          this.#setCursor(line, Math.min(col, (this.#lines[line] || '').length));
+          this.#textarea.focus();
+          return;
+        }
       }
     }
-    this.#cursor = { line, col };
-    if (this.#doc) this.#cursors.set(this.#doc.id, { line, col });
+
+    // Fallback (should rarely happen): estimate column from x coordinate
+    const textSpan = lineEl.querySelector('.text');
+    if (textSpan) {
+      const rect = textSpan.getBoundingClientRect();
+      const charWidth = 9.6;
+      const col = Math.max(0, Math.round((e.clientX - rect.left) / charWidth));
+      this.#setCursor(line, Math.min(col, (this.#lines[line] || '').length));
+    } else {
+      this.#setCursor(line, 0);
+    }
+    this.#textarea.focus();
   }
 
-  #restoreCursor() {
-    const { line, col } = this.#cursor;
-    const section = this.#pre.querySelector(`.section[data-line="${line}"]`);
-    if (!section) return;
-    const textSpan = section.querySelector('.text');
-    if (!textSpan) return;
-    let offset = col;
+  // Calculate column from a DOM node inside the .text container
+  #columnFromNode(textSpan, targetNode, offsetInNode) {
+    let col = 0;
     const walker = document.createTreeWalker(textSpan, NodeFilter.SHOW_TEXT);
     let node = walker.nextNode();
-    while (node && offset > node.textContent.length) {
-      offset -= node.textContent.length;
+    while (node && node !== targetNode) {
+      col += node.textContent.length;
       node = walker.nextNode();
     }
-    if (node) {
-      const sel = window.getSelection();
-      const range = document.createRange();
-      range.setStart(node, Math.min(offset, node.textContent.length));
-      range.collapse(true);
-      sel.removeAllRanges();
-      sel.addRange(range);
+    if (node === targetNode) {
+      col += offsetInNode;
     }
+    return col;
   }
 
-  #onInput(e) {
+  // ---------- Cursor rendering ----------
+  #setCursor(line, col) {
+    this.#cursor = { line, col };
+    const lineText = this.#lines[line] || '';
+    this.#textarea.value = lineText;
+    this.#textarea.setSelectionRange(col, col);
+    const targetY = this.#offset(line);
+    this.#scroll.scrollTop = targetY - this.#scroll.clientHeight / 2;
+    if (this.#doc) this.#cursors.set(this.#doc.id, { line, col });
+    if (this.#focused) this.#showCaret();
+  }
+
+  #showCaret() {
+    if (!this.#doc) return;
+    const { line, col } = this.#cursor;
+    const lineEl = this.#pool.find(el => parseInt(el.dataset.line) === line);
+    if (!lineEl) { this.#caret.style.display = 'none'; return; }
+    const textSpan = lineEl.querySelector('.text');
+    if (!textSpan) { this.#caret.style.display = 'none'; return; }
+
+    const baseLeft = textSpan.offsetLeft;
+    const x = this.#getColumnPixel(textSpan, col);
+    const lineTop = parseFloat(lineEl.style.top);
+    const lineHeight = this.#heights[line] || 24;
+
+    this.#caret.style.display = 'block';
+    this.#caret.style.left = `${baseLeft + x}px`;
+    this.#caret.style.top = `${lineTop}px`;
+    this.#caret.style.height = `${lineHeight}px`;
+  }
+
+  #hideCaret() {
+    this.#caret.style.display = 'none';
+  }
+
+  // Returns the pixel offset inside textSpan for a given column (0‑based)
+  #getColumnPixel(textSpan, col) {
+    let cur = 0;
+    let x = 0;
+    for (const child of textSpan.children) {
+      const len = child.textContent.length;
+      if (cur + len > col) {
+        const offset = col - cur;
+        const range = document.createRange();
+        const textNode = child.firstChild;
+        if (textNode) {
+          range.setStart(textNode, 0);
+          range.setEnd(textNode, offset);
+        }
+        x += range.getBoundingClientRect().width;
+        break;
+      } else {
+        x += child.getBoundingClientRect().width;
+        cur += len;
+      }
+    }
+    return x;
+  }
+
+  // ---------- Keyboard ----------
+  #onKey(e) {
     if (this.#composing) return;
-    const raw = this.#pre.innerText;
-    const newText = raw.replace(/\n$/, '');  // remove trailing newline
-    if (newText === this.#doc.text) return;
-    const oldText = this.#doc.text;
-    const cmd = new Replace(this.#doc.id, oldText, newText);
-    this.#applyCommand(cmd);
+    const { line, col } = this.#cursor;
+    const key = e.key;
+
+    if (key === 'ArrowUp') {
+      e.preventDefault();
+      if (line > 0) this.#setCursor(line - 1, Math.min(col, (this.#lines[line-1] || '').length));
+      return;
+    }
+    if (key === 'ArrowDown') {
+      e.preventDefault();
+      if (line < this.#lines.length - 1) this.#setCursor(line + 1, Math.min(col, (this.#lines[line+1] || '').length));
+      return;
+    }
+    if (key === 'ArrowLeft') {
+      e.preventDefault();
+      if (col > 0) this.#setCursor(line, col - 1);
+      else if (line > 0) this.#setCursor(line - 1, (this.#lines[line - 1] || '').length);
+      return;
+    }
+    if (key === 'ArrowRight') {
+      e.preventDefault();
+      if (col < (this.#lines[line] || '').length) this.#setCursor(line, col + 1);
+      else if (line < this.#lines.length - 1) this.#setCursor(line + 1, 0);
+      return;
+    }
+    if (key === 'Home') { e.preventDefault(); this.#setCursor(line, 0); return; }
+    if (key === 'End') { e.preventDefault(); this.#setCursor(line, (this.#lines[line] || '').length); return; }
+
+    if (key === 'Backspace') {
+      e.preventDefault();
+      if (col > 0) {
+        const off = this.#offsetFromLineCol(line, col - 1);
+        const deleted = this.#doc.text.charAt(off);
+        const cmd = new Delete(off, deleted);
+        this.#applyCommand(cmd);
+        this.#setCursor(line, col - 1);
+      } else if (line > 0) {
+        const prevLineLen = this.#lines[line - 1].length;
+        const off = this.#offsetFromLineCol(line - 1, prevLineLen);
+        const cmd = new Delete(off, '\n');
+        this.#applyCommand(cmd);
+        this.#setCursor(line - 1, prevLineLen);
+      }
+      return;
+    }
+    if (key === 'Delete') {
+      e.preventDefault();
+      if (col < (this.#lines[line] || '').length) {
+        const off = this.#offsetFromLineCol(line, col);
+        const deleted = this.#doc.text.charAt(off);
+        const cmd = new Delete(off, deleted);
+        this.#applyCommand(cmd);
+        this.#setCursor(line, col);
+      } else if (line < this.#lines.length - 1) {
+        const off = this.#offsetFromLineCol(line, this.#lines[line].length);
+        const cmd = new Delete(off, '\n');
+        this.#applyCommand(cmd);
+        this.#setCursor(line, col);
+      }
+      return;
+    }
+    if (key === 'Enter') {
+      e.preventDefault();
+      const off = this.#offsetFromLineCol(line, col);
+      const cmd = new Insert(off, '\n');
+      this.#applyCommand(cmd);
+      this.#setCursor(line + 1, 0);
+      return;
+    }
+    if (key === 'z' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); this.#undo(); return; }
+    if (key === 'y' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); this.#redo(); return; }
+
+    if (key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      e.preventDefault();
+      const off = this.#offsetFromLineCol(line, col);
+      const cmd = new Insert(off, key);
+      this.#applyCommand(cmd);
+      this.#setCursor(line, col + 1);
+    }
   }
 
   #applyCommand(cmd) {
-    const newText = cmd.apply(this.#doc.text);
+    const oldText = this.#store.text(this.#doc.id);
+    const newText = cmd.apply(oldText);
     this.#store.save(this.#doc.id, newText);
     this.#doc.text = newText;
     this.#lines = newText.split('\n');
+    this.#heights = new Array(this.#lines.length).fill(24);
     this.#history.push(cmd);
     this.#store.dispatch('doc', { id: this.#doc.id, text: newText });
-    // Keep cursor after re-render
-    this.#saveCursor();
-    this.#renderAll();
-    this.#restoreCursor();
+    this.#render();
   }
 
   #undo() {
     const cmd = this.#history.undo();
     if (!cmd) return;
-    const newText = cmd.undo(this.#doc.text);
+    const oldText = this.#store.text(this.#doc.id);
+    const newText = cmd.undo(oldText);
     this.#store.save(this.#doc.id, newText);
     this.#doc.text = newText;
     this.#lines = newText.split('\n');
+    this.#heights = new Array(this.#lines.length).fill(24);
     this.#store.dispatch('doc', { id: this.#doc.id, text: newText });
-    this.#saveCursor();
-    this.#renderAll();
-    this.#restoreCursor();
+    this.#render();
+    const off = cmd.off;
+    const { line, col } = this.#lineColFromOffset(off);
+    this.#setCursor(line, col);
   }
 
   #redo() {
     const cmd = this.#history.redo();
     if (!cmd) return;
-    const newText = cmd.apply(this.#doc.text);
+    const oldText = this.#store.text(this.#doc.id);
+    const newText = cmd.apply(oldText);
     this.#store.save(this.#doc.id, newText);
     this.#doc.text = newText;
     this.#lines = newText.split('\n');
+    this.#heights = new Array(this.#lines.length).fill(24);
     this.#store.dispatch('doc', { id: this.#doc.id, text: newText });
-    this.#saveCursor();
-    this.#renderAll();
-    this.#restoreCursor();
-  }
-
-  #onKey(e) {
-    const key = e.key;
-    if (key === 'z' && (e.ctrlKey || e.metaKey)) {
-      e.preventDefault();
-      this.#undo();
-    } else if (key === 'y' && (e.ctrlKey || e.metaKey)) {
-      e.preventDefault();
-      this.#redo();
-    }
+    this.#render();
+    const off = cmd.off + cmd.text.length;
+    const { line, col } = this.#lineColFromOffset(off);
+    this.#setCursor(line, col);
   }
 }
 // ---------- View (preview pane) ----------
