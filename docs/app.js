@@ -85,21 +85,102 @@ function attachScrollSync(editorEl, previewEl) {
 ----------------------------- */
 
 function renderMarkdown(src) {
-  // step 1: escape first
   let text = escapeHtml(src);
 
-  // step 2: headings
+  /* =====================================================
+     1. BLOCKS (structural elements first)
+  ===================================================== */
+
+  // HEADINGS
   text = text
-    .replace(/^# (.*)$/gm, "<h1>$1</h1>")
-    .replace(/^## (.*)$/gm, "<h2>$1</h2>");
+    .replace(/^###### (.*)$/gm, "<h6>$1</h6>")
+    .replace(/^##### (.*)$/gm, "<h5>$1</h5>")
+    .replace(/^#### (.*)$/gm, "<h4>$1</h4>")
+    .replace(/^### (.*)$/gm, "<h3>$1</h3>")
+    .replace(/^## (.*)$/gm, "<h2>$1</h2>")
+    .replace(/^# (.*)$/gm, "<h1>$1</h1>");
 
-  // step 3: bold
-  text = text.replace(/\*\*(.*?)\*\*/g, "<b>$1</b>");
+  // BLOCKQUOTE
+  text = text.replace(/^> (.*)$/gm, "<blockquote>$1</blockquote>");
 
-  // step 4: inline math placeholder
+  // UNORDERED LISTS (simple grouped version)
+  text = text.replace(
+    /(?:^[-*] .*(\n|$))+?/gm,
+    (match) => {
+      const items = match
+        .trim()
+        .split("\n")
+        .map((line) => line.replace(/^[-*] /, ""))
+        .map((item) => `<li>${item}</li>`)
+        .join("");
+
+      return `<ul>${items}</ul>`;
+    }
+  );
+
+  // ORDERED LISTS
+  text = text.replace(
+    /(?:^\d+\. .*(\n|$))+?/gm,
+    (match) => {
+      const items = match
+        .trim()
+        .split("\n")
+        .map((line) => line.replace(/^\d+\. /, ""))
+        .map((item) => `<li>${item}</li>`)
+        .join("");
+
+      return `<ol>${items}</ol>`;
+    }
+  );
+
+  /* =====================================================
+     2. INLINE ELEMENTS
+  ===================================================== */
+
+  // INLINE CODE
+  text = text.replace(/`([^`]+)`/g, "<code>$1</code>");
+
+  // BOLD
+  text = text.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
+
+  // ITALIC
+  text = text.replace(/\*(.+?)\*/g, "<i>$1</i>");
+
+  // LINKS [text](url)
+  text = text.replace(
+    /\[([^\]]+)\]\((https?:\/\/[^\)]+)\)/g,
+    `<a href="$2" target="_blank" rel="noopener">$1</a>`
+  );
+
+  // INLINE MATH
   text = text.replace(/\$(.+?)\$/g, "<span class='math'>$1</span>");
 
-  // step 5: line breaks
+  /* =====================================================
+     3. CODE BLOCKS (last step to avoid interference)
+  ===================================================== */
+
+  const codeBlocks = [];
+
+  text = text.replace(/```(\w+)?\n([\s\S]*?)```/g, (_, lang, code) => {
+    const id = codeBlocks.length;
+    codeBlocks.push({ lang, code });
+    return `@@CODE${id}@@`;
+  });
+
+  text = text.replace(/@@CODE(\d+)@@/g, (_, i) => {
+    const { lang, code } = codeBlocks[i];
+
+    const safe = escapeHtml(code);
+
+    return `
+      <pre><code class="lang-${lang || "text"}">${safe}</code></pre>
+    `;
+  });
+
+  /* =====================================================
+     4. FINAL LINE HANDLING
+  ===================================================== */
+
   text = text.replace(/\n/g, "<br>");
 
   return text;
