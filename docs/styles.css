@@ -118,6 +118,32 @@ body > main {
   overflow-x: auto;
 }
 
+/* Contenteditable pre styling */
+pre.edit {
+  font-family: var(--font-mono);
+  color: var(--text);
+  background: var(--bg);
+  padding: 0;
+  caret-color: var(--text);
+  tab-size: 2;
+  /* Ensure it fills the content area */
+  width: 100%;
+  min-height: 100%;
+}
+
+/* Section (line) */
+.section {
+  display: block;
+  min-height: var(--line-height);
+  line-height: var(--line-height);
+}
+
+/* Line feed span – just holds the <br> */
+.lf {
+  display: inline;
+}
+
+/* Gutter stays the same */
 /* ===== Virtual Lines ===== */
 .line {
   position: absolute;
