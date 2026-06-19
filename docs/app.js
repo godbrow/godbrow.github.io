@@ -486,10 +486,6 @@ class Edit {
       const blockKind = this.#detectBlockKind(i);
       if (blockKind) lineEl.classList.add(blockKind);
 
-      const numSpan = document.createElement('span');
-      numSpan.className = 'num';
-      numSpan.textContent = i + 1;
-
       const textSpan = document.createElement('span');
       textSpan.className = 'text';
       const tokens = this.#tokenizeLine(i);
@@ -500,7 +496,6 @@ class Edit {
         textSpan.appendChild(span);
       });
 
-      lineEl.appendChild(numSpan);
       lineEl.appendChild(textSpan);
       frag.appendChild(lineEl);
       this.#pool.push(lineEl);
@@ -632,27 +627,32 @@ class Edit {
     if (this.#focused) this.#showCaret();
   }
 
-  #showCaret() {
-    if (!this.#doc) return;
-    const { line, col } = this.#cursor;
-    const lineEl = this.#pool.find(el => parseInt(el.dataset.line) === line);
-    if (!lineEl) {
-      this.#caret.style.display = 'none';
-      return;
-    }
-    const textSpan = lineEl.querySelector('.text');
-    if (!textSpan) {
-      this.#caret.style.display = 'none';
-      return;
-    }
-    const x = this.#getColumnPixel(textSpan, col);
-    const lineTop = parseFloat(lineEl.style.top);
-    const lineHeight = this.#heights[line] || 24;
-    this.#caret.style.display = 'block';
-    this.#caret.style.left = `${x}px`;
-    this.#caret.style.top = `${lineTop}px`;
-    this.#caret.style.height = `${lineHeight}px`;
+#showCaret() {
+  if (!this.#doc) return;
+  const { line, col } = this.#cursor;
+  const lineEl = this.#pool.find(el => parseInt(el.dataset.line) === line);
+  if (!lineEl) {
+    this.#caret.style.display = 'none';
+    return;
   }
+  const textSpan = lineEl.querySelector('.text');
+  if (!textSpan) {
+    this.#caret.style.display = 'none';
+    return;
+  }
+
+  // Horizontal offset within the textSpan
+  const x = this.#getColumnPixel(textSpan, col);
+  // textSpan's left offset inside .content (offsetParent is .content)
+  const baseLeft = textSpan.offsetLeft;
+  const lineTop = parseFloat(lineEl.style.top);
+  const lineHeight = this.#heights[line] || 24;
+
+  this.#caret.style.display = 'block';
+  this.#caret.style.left = `${baseLeft + x}px`;
+  this.#caret.style.top = `${lineTop}px`;
+  this.#caret.style.height = `${lineHeight}px`;
+}
 
   #hideCaret() {
     if (this.#caret) this.#caret.style.display = 'none';
