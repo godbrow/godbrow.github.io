@@ -173,6 +173,16 @@ class Delete {
   }
 }
 
+class Replace {
+  constructor(id, oldText, newText) {
+    this.id = id;
+    this.old = oldText;
+    this.new = newText;
+  }
+  apply(doc) { return this.new; }
+  undo(doc) { return this.old; }
+}
+
 class History {
   constructor() { this.stack = []; this.idx = -1; }
   push(cmd) {
@@ -358,9 +368,10 @@ class List {
 }
 
 // ---------- Edit (contenteditable pre, native cursor) ----------
+// ---------- Edit (contenteditable pre, native cursor) ----------
 class Edit {
   #store; #doc; #lines; #heights; #scroll; #gutter; #pre;
-  #history; #parser; #cursor; #cursors; #idle;
+  #history; #parser; #cursor; #cursors;
   #composing = false;
 
   constructor(store, main) {
@@ -371,7 +382,7 @@ class Edit {
     this.#cursor = { line: 0, col: 0 };
     this.#history = new History();
 
-    // Create contenteditable pre (replaces hidden textarea)
+    // Create contenteditable pre
     this.#pre = document.createElement('pre');
     this.#pre.className = 'edit';
     this.#pre.setAttribute('contenteditable', 'true');
@@ -384,10 +395,8 @@ class Edit {
     this.#pre.addEventListener('compositionstart', () => { this.#composing = true; });
     this.#pre.addEventListener('compositionend', (e) => {
       this.#composing = false;
-      // Let the input handler deal with the final text
       this.#onInput(e);
     });
-    // Focus/blur for caret styling
     this.#pre.addEventListener('focus', () => this.#scroll.classList.add('focused'));
     this.#pre.addEventListener('blur', () => this.#scroll.classList.remove('focused'));
 
@@ -410,14 +419,12 @@ class Edit {
       ctx: (plug[doc.mode] || plug.txt).start()
     };
 
-    // Restore previous cursor
     const saved = this.#cursors.get(id);
     if (saved) {
       this.#cursor = { line: saved.line, col: saved.col };
     } else {
       this.#cursor = { line: 0, col: 0 };
     }
-    // Clamp to document bounds
     if (this.#cursor.line >= this.#lines.length)
       this.#cursor.line = Math.max(0, this.#lines.length - 1);
     if (this.#cursor.col > (this.#lines[this.#cursor.line] || '').length)
@@ -428,7 +435,6 @@ class Edit {
     this.#pre.focus();
   }
 
-  // Render the entire document into the contenteditable pre (non-virtualised for now)
   #renderAll() {
     const frag = document.createDocumentFragment();
     for (let i = 0; i < this.#lines.length; i++) {
@@ -439,58 +445,31 @@ class Edit {
     this.#pre.appendChild(frag);
   }
 
-  // Render a single line as a <div> with token spans and a <br>-based line feed
   #renderLine(lineIndex) {
     const div = document.createElement('div');
-    div.className = 'section';   // corresponds to StackEdit's cledit-section
+    div.className = 'section';
     div.dataset.line = lineIndex;
 
     const blockKind = this.#detectBlockKind(lineIndex);
     if (blockKind) div.classList.add(blockKind);
 
-    // Token spans
     const tokens = this.#tokenizeLine(lineIndex);
     const textSpan = document.createElement('span');
     textSpan.className = 'text';
     tokens.forEach(tok => {
       const span = document.createElement('span');
-      span.className = tok.kind;   // e.g., keyword, string, marker, text
+      span.className = tok.kind;
       span.textContent = tok.span;
       textSpan.appendChild(span);
     });
     div.appendChild(textSpan);
 
-    // Line feed (br) – required for contenteditable to have line breaks
     const lf = document.createElement('span');
     lf.className = 'lf';
-    lf.innerHTML = '<br>';       // actual <br> element
+    lf.innerHTML = '<br>';
     div.appendChild(lf);
 
     return div;
-  }
-
-  // Re‑highlight all visible sections (called after editing)
-  #rehighlight() {
-    const sections = this.#pre.querySelectorAll('.section');
-    sections.forEach((div) => {
-      const lineIndex = parseInt(div.dataset.line, 10);
-      if (isNaN(lineIndex)) return;
-      // Replace text span content with new tokens
-      const textSpan = div.querySelector('.text');
-      if (!textSpan) return;
-      textSpan.innerHTML = '';
-      const tokens = this.#tokenizeLine(lineIndex);
-      tokens.forEach(tok => {
-        const span = document.createElement('span');
-        span.className = tok.kind;
-        span.textContent = tok.span;
-        textSpan.appendChild(span);
-      });
-      // Update block class
-      div.className = 'section';  // reset
-      const blockKind = this.#detectBlockKind(lineIndex);
-      if (blockKind) div.classList.add(blockKind);
-    });
   }
 
   #detectBlockKind(lineIndex) {
@@ -509,7 +488,6 @@ class Edit {
     return plugin.line(this.#lines[lineIndex], ctx);
   }
 
-  // Save current cursor position from contenteditable DOM to model
   #saveCursor() {
     const sel = window.getSelection();
     if (!sel.rangeCount) return;
@@ -517,7 +495,6 @@ class Edit {
     const section = node?.parentElement?.closest('.section');
     if (!section) return;
     const line = parseInt(section.dataset.line, 10);
-    // Find column by counting characters before the cursor within the .text span
     const textSpan = section.querySelector('.text');
     let col = 0;
     if (textSpan) {
@@ -535,7 +512,6 @@ class Edit {
     if (this.#doc) this.#cursors.set(this.#doc.id, { line, col });
   }
 
-  // Restore cursor from model into contenteditable
   #restoreCursor() {
     const { line, col } = this.#cursor;
     const section = this.#pre.querySelector(`.section[data-line="${line}"]`);
@@ -559,54 +535,33 @@ class Edit {
     }
   }
 
-  // ---------- Input handling (contentEditable fires 'input') ----------
   #onInput(e) {
     if (this.#composing) return;
-    // Extract plain text from contenteditable
-    const raw = this.#pre.innerText;   // innerText gives us the raw text with newlines
-    // innerText in a pre typically keeps newlines as \n
-    const newText = raw.replace(/\n$/, '');  // trailing newline might be extra
-    if (newText === this.#doc.text) return;  // no change
+    const raw = this.#pre.innerText;
+    const newText = raw.replace(/\n$/, '');  // remove trailing newline
+    if (newText === this.#doc.text) return;
     const oldText = this.#doc.text;
-    // Create a command – we use a "replace all" for simplicity (undo knows old text)
-    // For fine‑grained undo we'd diff, but for v1 we replace the whole document.
     const cmd = new Replace(this.#doc.id, oldText, newText);
     this.#applyCommand(cmd);
   }
 
-  // Replace command (holds old and new full text)
-  class Replace {
-    constructor(id, oldText, newText) {
-      this.id = id;
-      this.old = oldText;
-      this.new = newText;
-    }
-    apply(doc) { return this.new; }
-    undo(doc) { return this.old; }
-  }
-
-  // Apply a command and update everything
   #applyCommand(cmd) {
-    if (cmd instanceof Replace) {
-      const newText = cmd.new;
-      this.#store.save(this.#doc.id, newText);
-      this.#doc.text = newText;
-      this.#lines = newText.split('\n');
-      this.#history.push(cmd);
-      this.#store.dispatch('doc', { id: this.#doc.id, text: newText });
-      // Re‑render and keep cursor
-      this.#saveCursor();          // save before render
-      this.#renderAll();
-      this.#rehighlight();        // highlight is already in renderAll, but double safe
-      this.#restoreCursor();
-    }
+    const newText = cmd.apply(this.#doc.text);
+    this.#store.save(this.#doc.id, newText);
+    this.#doc.text = newText;
+    this.#lines = newText.split('\n');
+    this.#history.push(cmd);
+    this.#store.dispatch('doc', { id: this.#doc.id, text: newText });
+    // Keep cursor after re-render
+    this.#saveCursor();
+    this.#renderAll();
+    this.#restoreCursor();
   }
 
-  // Undo/redo using the same mechanism
   #undo() {
     const cmd = this.#history.undo();
     if (!cmd) return;
-    const newText = cmd.undo();
+    const newText = cmd.undo(this.#doc.text);
     this.#store.save(this.#doc.id, newText);
     this.#doc.text = newText;
     this.#lines = newText.split('\n');
@@ -619,7 +574,7 @@ class Edit {
   #redo() {
     const cmd = this.#history.redo();
     if (!cmd) return;
-    const newText = cmd.apply();
+    const newText = cmd.apply(this.#doc.text);
     this.#store.save(this.#doc.id, newText);
     this.#doc.text = newText;
     this.#lines = newText.split('\n');
@@ -629,7 +584,6 @@ class Edit {
     this.#restoreCursor();
   }
 
-  // Keyboard shortcuts (Ctrl+Z/Y etc.)
   #onKey(e) {
     const key = e.key;
     if (key === 'z' && (e.ctrlKey || e.metaKey)) {
@@ -639,7 +593,6 @@ class Edit {
       e.preventDefault();
       this.#redo();
     }
-    // All other keys are handled natively by contentEditable
   }
 }
 // ---------- View (preview pane) ----------
