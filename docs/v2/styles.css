@@ -1,0 +1,63 @@
+/* =========================
+   SYSTEM THEME TOKENS
+========================= */
+
+:root {
+  --bg: #0b0f17;
+  --panel: #111827;
+  --text: #e5e7eb;
+  --accent: #60a5fa;
+  --border: #1f2937;
+  --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #ffffff;
+    --panel: #f3f4f6;
+    --text: #111827;
+    --border: #e5e7eb;
+  }
+}
+
+/* =========================
+   BASE LAYOUT
+========================= */
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, sans-serif;
+  height: 100vh;
+}
+
+/* main is root layout */
+main {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  height: 100vh;
+}
+
+/* editor + preview panels */
+section {
+  overflow: auto;
+  padding: 12px;
+}
+
+/* editor */
+section[role="editor-panel"] {
+  border-right: 1px solid var(--border);
+  font-family: var(--mono);
+  white-space: pre-wrap;
+}
+
+/* preview */
+section[role="preview-panel"] {
+  background: var(--panel);
+}
+
+/* active block */
+[data-block-active="true"] {
+  outline: 2px solid var(--accent);
+}
