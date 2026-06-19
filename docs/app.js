@@ -358,6 +358,8 @@ class List {
 class Edit {
   #store; #doc; #lines; #heights; #scroll; #gutter; #textarea;
   #history; #parser; #cursor; #pool; #sentinel;
+  #caret = null;               // visual cursor element
+  #focused = false;
   #composing = false;
   #composeStartText = '';
 
@@ -376,9 +378,17 @@ class Edit {
     this.#sentinel.className = 'sentinel';
     this.#scroll.appendChild(this.#sentinel);
 
+    // Create a persistent caret element (hidden by default)
+    this.#caret = document.createElement('span');
+    this.#caret.className = 'caret';
+    this.#caret.style.cssText = 'position:absolute;width:2px;height:var(--line-height);background:var(--text);display:none;pointer-events:none;z-index:2;';
+    this.#scroll.appendChild(this.#caret);
+
     this.#scroll.addEventListener('scroll', () => this.#render());
     this.#scroll.addEventListener('mousedown', (e) => this.#onMouseDown(e));
     this.#textarea.addEventListener('keydown', (e) => this.#onKey(e));
+    this.#textarea.addEventListener('focus', () => { this.#focused = true; this.#showCaret(); });
+    this.#textarea.addEventListener('blur', () => { this.#focused = false; this.#hideCaret(); });
 
     this.#textarea.addEventListener('compositionstart', () => {
       this.#composing = true;
@@ -390,13 +400,6 @@ class Edit {
       const { line, col } = this.#cursor;
       const oldLine = this.#composeStartText;
       if (composed !== oldLine) {
-        // Replace the whole line with the composed text
-        const off = this.#offsetFromLineCol(line, 0);
-        const delCmd = new Delete(off, oldLine + '\n'); // remove old line + newline
-        // Actually we need to be careful: the line might not have a trailing newline.
-        // Simpler: we replace the whole line content by deleting oldLine and inserting composed.
-        // We'll handle it as a delete of oldLine.length chars at line start, then insert.
-        // For a more robust approach, we'll compute offset of line start, delete oldLine, insert composed.
         const startOff = this.#offsetFromLineCol(line, 0);
         const del = new Delete(startOff, oldLine);
         this.#applyCommand(del);
@@ -434,9 +437,8 @@ class Edit {
     this.#cursor = { line: 0, col: 0 };
     this.#clearPool();
     this.#render();
-    // Auto‑focus and place cursor at the start
     this.#setCursor(0, 0);
-    this.#textarea.focus();
+    this.#textarea.focus();                     // triggers focus → caret appears
   }
 
   #clearPool() {
@@ -506,6 +508,9 @@ class Edit {
 
     this.#scroll.appendChild(frag);
     this.#sentinel.style.height = `${this.#offset(this.#lines.length)}px`;
+
+    // After rendering, reposition the caret if it's visible
+    if (this.#focused) this.#showCaret();
   }
 
   #offset(untilLine) {
@@ -514,7 +519,6 @@ class Edit {
     return o;
   }
 
-  // Convert line/col to absolute character offset
   #offsetFromLineCol(line, col) {
     let off = 0;
     for (let i = 0; i < line; i++) off += this.#lines[i].length + 1; // +1 for newline
@@ -522,23 +526,15 @@ class Edit {
     return off;
   }
 
-  // Convert absolute offset to line/col
   #lineColFromOffset(off) {
-    let l = 0, c = 0;
-    let acc = 0;
+    let l = 0, c = 0, acc = 0;
     while (l < this.#lines.length) {
       const lineLen = this.#lines[l].length;
-      if (acc + lineLen >= off) {
-        c = off - acc;
-        break;
-      }
-      acc += lineLen + 1; // +1 for newline
+      if (acc + lineLen >= off) { c = off - acc; break; }
+      acc += lineLen + 1;
       l++;
     }
-    if (l >= this.#lines.length) {
-      l = this.#lines.length - 1;
-      c = this.#lines[l].length;
-    }
+    if (l >= this.#lines.length) { l = this.#lines.length - 1; c = this.#lines[l].length; }
     return { line: l, col: Math.min(c, this.#lines[l].length) };
   }
 
@@ -558,19 +554,74 @@ class Edit {
     return 'para';
   }
 
+  // ---------- Click handling with precise caret positioning ----------
   #onMouseDown(e) {
     const lineEl = e.target.closest('.line');
     if (!lineEl) return;
     const line = parseInt(lineEl.dataset.line, 10);
+    // Use the browser's own caret position from point for pixel‑perfect column
+    const caretPos = document.caretPositionFromPoint(e.clientX, e.clientY);
+    if (caretPos) {
+      // Walk up to find our token span (or the .text span)
+      let node = caretPos.offsetNode;
+      while (node && node !== lineEl && node !== this.#scroll) {
+        if (node.parentNode?.classList?.contains('text')) {
+          // We are inside a token or text node – compute column
+          const col = this.#columnFromNode(node, caretPos.offset);
+          this.#setCursor(line, col);
+          this.#textarea.focus();
+          return;
+        }
+        node = node.parentNode;
+      }
+    }
+    // Fallback: estimate from x position (monospace approximation)
     const textSpan = lineEl.querySelector('.text');
-    if (!textSpan) return;
-    const rect = textSpan.getBoundingClientRect();
-    const charWidth = 9.6;
-    const col = Math.max(0, Math.round((e.clientX - rect.left) / charWidth));
-    this.#setCursor(line, col);
+    if (textSpan) {
+      const rect = textSpan.getBoundingClientRect();
+      const charWidth = 9.6;
+      const col = Math.max(0, Math.round((e.clientX - rect.left) / charWidth));
+      this.#setCursor(line, Math.min(col, (this.#lines[line] || '').length));
+    } else {
+      this.#setCursor(line, 0);
+    }
     this.#textarea.focus();
   }
 
+  // Calculate column from a DOM node inside the line's .text container
+  #columnFromNode(node, offsetInNode) {
+    // node is a text node inside a token span (or directly inside .text)
+    let col = 0;
+    // Find the containing token span (or use node itself if it's the .text)
+    let tokenSpan = node.parentNode;
+    if (tokenSpan && tokenSpan.classList.contains('text')) {
+      // The node is directly inside .text (no token spans, plain text)
+      // Just sum the lengths of previous siblings and add offset
+      for (let child = tokenSpan.firstChild; child && child !== node; child = child.nextSibling) {
+        if (child.nodeType === 3) col += child.textContent.length;
+        else if (child.nodeType === 1) col += child.textContent.length;
+      }
+      col += offsetInNode;
+      return col;
+    }
+    // Otherwise, tokenSpan should be a span with a class
+    while (tokenSpan && !tokenSpan.classList.contains('text') && tokenSpan !== this.#scroll) {
+      tokenSpan = tokenSpan.parentNode;
+    }
+    if (!tokenSpan || !tokenSpan.classList.contains('text')) return 0;
+    // Sum lengths of all token spans before tokenSpan
+    let sibling = tokenSpan.firstChild;
+    while (sibling && sibling !== node.parentNode) {
+      if (sibling.nodeType === 1) col += sibling.textContent.length;
+      else if (sibling.nodeType === 3) col += sibling.textContent.length;
+      sibling = sibling.nextSibling;
+    }
+    // Add offset within the current text node
+    col += offsetInNode;
+    return col;
+  }
+
+  // ---------- Cursor rendering ----------
   #setCursor(line, col) {
     this.#cursor = { line, col };
     const lineText = this.#lines[line] || '';
@@ -578,16 +629,68 @@ class Edit {
     this.#textarea.setSelectionRange(col, col);
     const targetY = this.#offset(line);
     this.#scroll.scrollTop = targetY - this.#scroll.clientHeight / 2;
-    this.#textarea.focus(); // ensure focus is kept
+    if (this.#focused) this.#showCaret();
   }
 
-  #onKey(e) {
-    if (this.#composing) return; // let IME handle everything
+  #showCaret() {
+    if (!this.#doc) return;
+    const { line, col } = this.#cursor;
+    const lineEl = this.#pool.find(el => parseInt(el.dataset.line) === line);
+    if (!lineEl) {
+      this.#caret.style.display = 'none';
+      return;
+    }
+    const textSpan = lineEl.querySelector('.text');
+    if (!textSpan) {
+      this.#caret.style.display = 'none';
+      return;
+    }
+    const x = this.#getColumnPixel(textSpan, col);
+    const lineTop = parseFloat(lineEl.style.top);
+    const lineHeight = this.#heights[line] || 24;
+    this.#caret.style.display = 'block';
+    this.#caret.style.left = `${x}px`;
+    this.#caret.style.top = `${lineTop}px`;
+    this.#caret.style.height = `${lineHeight}px`;
+  }
 
+  #hideCaret() {
+    if (this.#caret) this.#caret.style.display = 'none';
+  }
+
+  #getColumnPixel(textSpan, col) {
+    // textSpan contains child spans (tokens). Iterate them and sum widths.
+    let cur = 0;
+    let x = 0;
+    for (const child of textSpan.children) {
+      const len = child.textContent.length;
+      if (cur + len >= col) {
+        // Column falls inside this token
+        const offset = col - cur;
+        // Measure width of the substring from start of child to offset
+        const range = document.createRange();
+        if (child.firstChild) {
+          range.setStart(child.firstChild, 0);
+          range.setEnd(child.firstChild, offset);
+        }
+        const rect = range.getBoundingClientRect();
+        x += rect.width;
+        break;
+      } else {
+        // Add full width of this token
+        x += child.getBoundingClientRect().width;
+        cur += len;
+      }
+    }
+    return x;
+  }
+
+  // ---------- Keyboard handling (unchanged from fixed version) ----------
+  #onKey(e) {
+    if (this.#composing) return;
     const { line, col } = this.#cursor;
     const key = e.key;
 
-    // Navigation
     if (key === 'ArrowUp') {
       e.preventDefault();
       if (line > 0) this.#setCursor(line - 1, Math.min(col, (this.#lines[line-1] || '').length));
@@ -601,7 +704,7 @@ class Edit {
     if (key === 'ArrowLeft') {
       e.preventDefault();
       if (col > 0) this.#setCursor(line, col - 1);
-      else if (line > 0) this.#setCursor(line - 1, this.#lines[line - 1].length);
+      else if (line > 0) this.#setCursor(line - 1, (this.#lines[line - 1] || '').length);
       return;
     }
     if (key === 'ArrowRight') {
@@ -622,16 +725,14 @@ class Edit {
         this.#applyCommand(cmd);
         this.#setCursor(line, col - 1);
       } else if (line > 0) {
-        // Merge with previous line: delete the newline character
         const prevLineLen = this.#lines[line - 1].length;
-        const off = this.#offsetFromLineCol(line - 1, prevLineLen); // position of newline
+        const off = this.#offsetFromLineCol(line - 1, prevLineLen);
         const cmd = new Delete(off, '\n');
         this.#applyCommand(cmd);
         this.#setCursor(line - 1, prevLineLen);
       }
       return;
     }
-
     if (key === 'Delete') {
       e.preventDefault();
       if (col < (this.#lines[line] || '').length) {
@@ -641,7 +742,6 @@ class Edit {
         this.#applyCommand(cmd);
         this.#setCursor(line, col);
       } else if (line < this.#lines.length - 1) {
-        // Merge next line: delete the newline at end of current line
         const off = this.#offsetFromLineCol(line, this.#lines[line].length);
         const cmd = new Delete(off, '\n');
         this.#applyCommand(cmd);
@@ -649,7 +749,6 @@ class Edit {
       }
       return;
     }
-
     if (key === 'Enter') {
       e.preventDefault();
       const off = this.#offsetFromLineCol(line, col);
@@ -658,20 +757,9 @@ class Edit {
       this.#setCursor(line + 1, 0);
       return;
     }
+    if (key === 'z' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); this.#undo(); return; }
+    if (key === 'y' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); this.#redo(); return; }
 
-    // Undo / Redo
-    if (key === 'z' && (e.ctrlKey || e.metaKey)) {
-      e.preventDefault();
-      this.#undo();
-      return;
-    }
-    if (key === 'y' && (e.ctrlKey || e.metaKey)) {
-      e.preventDefault();
-      this.#redo();
-      return;
-    }
-
-    // Printable character
     if (key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
       e.preventDefault();
       const off = this.#offsetFromLineCol(line, col);
@@ -702,7 +790,7 @@ class Edit {
     this.#lines = newText.split('\n');
     this.#heights = new Array(this.#lines.length).fill(24);
     this.#render();
-    const off = cmd.off; // approximate: put cursor at the edit position
+    const off = cmd.off;
     const { line, col } = this.#lineColFromOffset(off);
     this.#setCursor(line, col);
   }
@@ -717,7 +805,7 @@ class Edit {
     this.#lines = newText.split('\n');
     this.#heights = new Array(this.#lines.length).fill(24);
     this.#render();
-    const off = cmd.off + cmd.text.length; // after inserted text
+    const off = cmd.off + cmd.text.length;
     const { line, col } = this.#lineColFromOffset(off);
     this.#setCursor(line, col);
   }
