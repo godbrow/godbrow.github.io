@@ -1,94 +1,81 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="system">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Markdown Editor</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+
+  <title>Vanilla Markdown Lab</title>
+
+  <!-- Styles -->
   <link rel="stylesheet" href="./styles.css" />
-  <meta name="color-scheme" content="light dark" />
 </head>
+
 <body>
-  <a class="skip-link" href="#editor">Skip to editor</a>
 
-  <header class="appbar">
-    <div class="brand">
-      <span class="dot" aria-hidden="true"></span>
-      <span class="title">Markdown Editor</span>
-    </div>
+  <!-- =====================================================
+       APP SHELL
+       Keep semantic, minimal, and extension-friendly
+  ====================================================== -->
 
-    <div class="controls" role="toolbar" aria-label="Editor tools">
-      <button type="button" class="btn" data-action="bold" aria-label="Bold (Ctrl/⌘+B)">
-        <span aria-hidden="true">𝐁</span>
-      </button>
-      <button type="button" class="btn" data-action="italic" aria-label="Italic (Ctrl/⌘+I)">
-        <span aria-hidden="true">𝑰</span>
-      </button>
-      <button type="button" class="btn" data-action="ul" aria-label="Bulleted list">
-        <span aria-hidden="true">• List</span>
-      </button>
-      <button type="button" class="btn" data-action="ol" aria-label="Numbered list">
-        <span aria-hidden="true">1. List</span>
-      </button>
-      <button type="button" class="btn" data-action="quote" aria-label="Blockquote">
-        <span aria-hidden="true">❝</span>
-      </button>
-      <button type="button" class="btn" data-action="code" aria-label="Inline code">
-        <span aria-hidden="true">{"}"</span>
-      </button>
+  <main id="app">
 
-      <span class="divider" aria-hidden="true"></span>
+    <!--
+      EDITOR PANE
+      - textarea is intentional (no dependency editors yet)
+      - later can be replaced with contenteditable or canvas layer
+    -->
+    <textarea
+      id="editor"
+      spellcheck="false"
+      aria-label="Markdown editor"
+    ></textarea>
 
-      <button type="button" class="btn" data-action="export-md" aria-label="Export markdown (.md)">
-        Export .md
-      </button>
+    <!--
+      PREVIEW PANE
+      - rendered HTML output
+      - future: can become virtualized renderer
+    -->
+    <section
+      id="preview"
+      aria-label="Markdown preview"
+    ></section>
 
-      <span class="divider" aria-hidden="true"></span>
-
-      <button type="button" class="btn" data-action="split" aria-pressed="true" aria-label="Toggle split view">
-        Split
-      </button>
-
-      <button type="button" class="btn" data-action="theme" aria-label="Toggle theme">
-        Theme
-      </button>
-    </div>
-  </header>
-
-  <main class="layout">
-    <section class="panel" id="editor" aria-label="Markdown editor">
-      <div class="panel-head">
-        <h2 class="panel-title">Editor</h2>
-        <div class="hint" aria-live="polite">
-          <span class="key">Ctrl/⌘</span>+<span class="key">B</span>, <span class="key">I</span>, <span class="key">/</span>
-        </div>
-      </div>
-
-      <textarea
-        id="md"
-        class="editor"
-        spellcheck="false"
-        aria-label="Markdown input"
-        placeholder="Type Markdown here…"
-      ></textarea>
-    </section>
-
-    <section class="panel" id="preview" aria-label="Markdown preview">
-      <div class="panel-head">
-        <h2 class="panel-title">Preview</h2>
-        <div class="hint" id="status" aria-live="polite"></div>
-      </div>
-
-      <div id="previewContent" class="preview" role="article" aria-live="polite"></div>
-    </section>
   </main>
 
-  <footer class="footer">
-    <span>Saved automatically to this browser.</span>
-    <button class="link-btn" type="button" data-action="clear" aria-label="Clear saved content">
-      Clear saved
-    </button>
-  </footer>
+  <!-- =====================================================
+       FUTURE EXTENSION POINTS (IMPORTANT)
+       These are intentionally empty hooks for:
+       - toolbar system
+       - plugin loader
+       - command palette
+  ====================================================== -->
+
+  <div id="toolbar-root" hidden></div>
+  <div id="plugin-root" hidden></div>
+
+  <!-- =====================================================
+       APP SCRIPT
+       ES module entry point
+  ====================================================== -->
 
   <script type="module" src="./app.js"></script>
+
+  <!-- =====================================================
+       SERVICE WORKER REGISTRATION (optional)
+       kept minimal; actual sw.js handles caching
+  ====================================================== -->
+
+  <script>
+    if ("serviceWorker" in navigator) {
+      window.addEventListener("load", async () => {
+        try {
+          await navigator.serviceWorker.register("./sw.js");
+        } catch (e) {
+          console.warn("SW registration failed:", e);
+        }
+      });
+    }
+  </script>
+
 </body>
 </html>
