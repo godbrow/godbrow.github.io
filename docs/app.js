@@ -216,12 +216,13 @@ class Store {
         this.#state.theme = data;
         document.documentElement.classList.toggle('dark', data === 'dark');
         break;
-      case 'doc': {
-        const { id, text } = data;
-        const doc = this.#state.docs.find(d => d.id === id);
-        if (doc) doc.text = text;
-        break;
-      }
+case 'doc': {
+  const { id, text } = data;
+  const doc = this.#state.docs.find(d => d.id === id);
+  if (doc) doc.text = text;
+  this.#notify('doc');   // <-- crucial: tell components the text changed
+  break;
+}
     }
     this.#persist(action);
     this.#subs.forEach(fn => fn(action, this.#state));
@@ -357,11 +358,9 @@ class List {
 // ---------- Edit (virtualised editor, fixed input & line ops) ----------
 class Edit {
   #store; #doc; #lines; #heights; #scroll; #gutter; #textarea;
-  #history; #parser; #cursor; #pool; #sentinel;
-  #caret = null;               // visual cursor element
-  #focused = false;
-  #composing = false;
-  #composeStartText = '';
+  #history; #parser; #cursor; #pool; #sentinel; #caret;
+  #focused = false; #composing = false; #composeStartText = '';
+  #cursors = new Map();   // per‑document cursor memory
 
   constructor(store, main) {
     this.#store = store;
@@ -378,7 +377,7 @@ class Edit {
     this.#sentinel.className = 'sentinel';
     this.#scroll.appendChild(this.#sentinel);
 
-    // Create a persistent caret element (hidden by default)
+    // Blinking cursor element
     this.#caret = document.createElement('span');
     this.#caret.className = 'caret';
     this.#caret.style.cssText = 'position:absolute;width:2px;height:var(--line-height);background:var(--text);display:none;pointer-events:none;z-index:2;';
@@ -434,11 +433,24 @@ class Edit {
       plugin: plug[doc.mode] || plug.txt,
       ctx: (plug[doc.mode] || plug.txt).start()
     };
-    this.#cursor = { line: 0, col: 0 };
+
+    // Restore previous cursor if we have one for this document
+    const saved = this.#cursors.get(id);
+    if (saved) {
+      this.#cursor = { line: saved.line, col: saved.col };
+    } else {
+      this.#cursor = { line: 0, col: 0 };
+    }
+    // Ensure cursor is within bounds
+    if (this.#cursor.line >= this.#lines.length)
+      this.#cursor.line = Math.max(0, this.#lines.length - 1);
+    if (this.#cursor.col > (this.#lines[this.#cursor.line] || '').length)
+      this.#cursor.col = (this.#lines[this.#cursor.line] || '').length;
+
     this.#clearPool();
     this.#render();
-    this.#setCursor(0, 0);
-    this.#textarea.focus();                     // triggers focus → caret appears
+    this.#setCursor(this.#cursor.line, this.#cursor.col);
+    this.#textarea.focus();
   }
 
   #clearPool() {
@@ -467,6 +479,7 @@ class Edit {
     const frag = document.createDocumentFragment();
     const gutterFrag = document.createDocumentFragment();
 
+    // Gutter numbers
     for (let i = start; i <= end; i++) {
       const lineNum = document.createElement('div');
       lineNum.textContent = i + 1;
@@ -477,6 +490,7 @@ class Edit {
     this.#gutter.innerHTML = '';
     this.#gutter.appendChild(gutterFrag);
 
+    // Lines (no duplicate line numbers)
     for (let i = start; i <= end; i++) {
       const lineEl = document.createElement('div');
       lineEl.className = 'line';
@@ -496,7 +510,7 @@ class Edit {
         textSpan.appendChild(span);
       });
 
-      lineEl.appendChild(textSpan);
+      lineEl.appendChild(textSpan);   // only the text span, no .num
       frag.appendChild(lineEl);
       this.#pool.push(lineEl);
     }
@@ -504,7 +518,7 @@ class Edit {
     this.#scroll.appendChild(frag);
     this.#sentinel.style.height = `${this.#offset(this.#lines.length)}px`;
 
-    // After rendering, reposition the caret if it's visible
+    // Reposition caret after render if focused
     if (this.#focused) this.#showCaret();
   }
 
@@ -516,7 +530,7 @@ class Edit {
 
   #offsetFromLineCol(line, col) {
     let off = 0;
-    for (let i = 0; i < line; i++) off += this.#lines[i].length + 1; // +1 for newline
+    for (let i = 0; i < line; i++) off += this.#lines[i].length + 1;
     off += col;
     return off;
   }
@@ -549,70 +563,68 @@ class Edit {
     return 'para';
   }
 
-  // ---------- Click handling with precise caret positioning ----------
+  // ---------- Precise click handling ----------
   #onMouseDown(e) {
     const lineEl = e.target.closest('.line');
     if (!lineEl) return;
     const line = parseInt(lineEl.dataset.line, 10);
-    // Use the browser's own caret position from point for pixel‑perfect column
-    const caretPos = document.caretPositionFromPoint(e.clientX, e.clientY);
-    if (caretPos) {
-      // Walk up to find our token span (or the .text span)
-      let node = caretPos.offsetNode;
-      while (node && node !== lineEl && node !== this.#scroll) {
-        if (node.parentNode?.classList?.contains('text')) {
-          // We are inside a token or text node – compute column
-          const col = this.#columnFromNode(node, caretPos.offset);
-          this.#setCursor(line, col);
-          this.#textarea.focus();
-          return;
-        }
-        node = node.parentNode;
-      }
-    }
-    // Fallback: estimate from x position (monospace approximation)
     const textSpan = lineEl.querySelector('.text');
-    if (textSpan) {
-      const rect = textSpan.getBoundingClientRect();
-      const charWidth = 9.6;
-      const col = Math.max(0, Math.round((e.clientX - rect.left) / charWidth));
-      this.#setCursor(line, Math.min(col, (this.#lines[line] || '').length));
-    } else {
+    if (!textSpan) {
       this.#setCursor(line, 0);
+      this.#textarea.focus();
+      return;
     }
+
+    // X coordinate relative to the text span
+    const rect = textSpan.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+
+    // Use token bounding boxes to find the exact column
+    const col = this.#columnAtX(textSpan, x);
+    this.#setCursor(line, Math.min(col, (this.#lines[line] || '').length));
     this.#textarea.focus();
   }
 
-  // Calculate column from a DOM node inside the line's .text container
-  #columnFromNode(node, offsetInNode) {
-    // node is a text node inside a token span (or directly inside .text)
+  // Returns the character column inside textSpan for a horizontal offset x (in pixels).
+  #columnAtX(textSpan, x) {
     let col = 0;
-    // Find the containing token span (or use node itself if it's the .text)
-    let tokenSpan = node.parentNode;
-    if (tokenSpan && tokenSpan.classList.contains('text')) {
-      // The node is directly inside .text (no token spans, plain text)
-      // Just sum the lengths of previous siblings and add offset
-      for (let child = tokenSpan.firstChild; child && child !== node; child = child.nextSibling) {
-        if (child.nodeType === 3) col += child.textContent.length;
-        else if (child.nodeType === 1) col += child.textContent.length;
+    const children = textSpan.children;
+    for (const child of children) {
+      const childRect = child.getBoundingClientRect();
+      const childLeft = childRect.left - textSpan.getBoundingClientRect().left;
+      const childRight = childRect.right - textSpan.getBoundingClientRect().left;
+
+      if (x >= childLeft && x <= childRight) {
+        // Inside this token – find exact offset
+        const offsetX = x - childLeft;
+        const text = child.textContent;
+        // Binary search within the text node for the character boundary
+        let low = 0, high = text.length;
+        while (low < high) {
+          const mid = Math.floor((low + high) / 2);
+          const range = document.createRange();
+          // child should contain a text node (the only child)
+          const textNode = child.firstChild;
+          if (!textNode) break;
+          range.setStart(textNode, 0);
+          range.setEnd(textNode, mid);
+          const rect = range.getBoundingClientRect();
+          const width = rect.width;
+          if (width > offsetX) {
+            high = mid;
+          } else {
+            low = mid + 1;
+          }
+        }
+        return col + low;
+      } else if (x > childRight) {
+        col += child.textContent.length;
+      } else {
+        // x is left of this token – stop (should not happen as we iterate left->right)
+        break;
       }
-      col += offsetInNode;
-      return col;
     }
-    // Otherwise, tokenSpan should be a span with a class
-    while (tokenSpan && !tokenSpan.classList.contains('text') && tokenSpan !== this.#scroll) {
-      tokenSpan = tokenSpan.parentNode;
-    }
-    if (!tokenSpan || !tokenSpan.classList.contains('text')) return 0;
-    // Sum lengths of all token spans before tokenSpan
-    let sibling = tokenSpan.firstChild;
-    while (sibling && sibling !== node.parentNode) {
-      if (sibling.nodeType === 1) col += sibling.textContent.length;
-      else if (sibling.nodeType === 3) col += sibling.textContent.length;
-      sibling = sibling.nextSibling;
-    }
-    // Add offset within the current text node
-    col += offsetInNode;
+    // Click after all tokens → end of line
     return col;
   }
 
@@ -622,62 +634,55 @@ class Edit {
     const lineText = this.#lines[line] || '';
     this.#textarea.value = lineText;
     this.#textarea.setSelectionRange(col, col);
+    // Keep line in view
     const targetY = this.#offset(line);
     this.#scroll.scrollTop = targetY - this.#scroll.clientHeight / 2;
+    // Remember position for this document
+    if (this.#doc) this.#cursors.set(this.#doc.id, { line, col });
     if (this.#focused) this.#showCaret();
   }
 
-#showCaret() {
-  if (!this.#doc) return;
-  const { line, col } = this.#cursor;
-  const lineEl = this.#pool.find(el => parseInt(el.dataset.line) === line);
-  if (!lineEl) {
-    this.#caret.style.display = 'none';
-    return;
-  }
-  const textSpan = lineEl.querySelector('.text');
-  if (!textSpan) {
-    this.#caret.style.display = 'none';
-    return;
-  }
+  #showCaret() {
+    if (!this.#doc) return;
+    const { line, col } = this.#cursor;
+    const lineEl = this.#pool.find(el => parseInt(el.dataset.line) === line);
+    if (!lineEl) { this.#caret.style.display = 'none'; return; }
+    const textSpan = lineEl.querySelector('.text');
+    if (!textSpan) { this.#caret.style.display = 'none'; return; }
 
-  // Horizontal offset within the textSpan
-  const x = this.#getColumnPixel(textSpan, col);
-  // textSpan's left offset inside .content (offsetParent is .content)
-  const baseLeft = textSpan.offsetLeft;
-  const lineTop = parseFloat(lineEl.style.top);
-  const lineHeight = this.#heights[line] || 24;
+    const baseLeft = textSpan.offsetLeft;               // left of .text inside .content
+    const x = this.#getColumnPixel(textSpan, col);      // width of text before col
+    const lineTop = parseFloat(lineEl.style.top);
+    const lineHeight = this.#heights[line] || 24;
 
-  this.#caret.style.display = 'block';
-  this.#caret.style.left = `${baseLeft + x}px`;
-  this.#caret.style.top = `${lineTop}px`;
-  this.#caret.style.height = `${lineHeight}px`;
-}
+    this.#caret.style.display = 'block';
+    this.#caret.style.left = `${baseLeft + x}px`;
+    this.#caret.style.top = `${lineTop}px`;
+    this.#caret.style.height = `${lineHeight}px`;
+  }
 
   #hideCaret() {
-    if (this.#caret) this.#caret.style.display = 'none';
+    this.#caret.style.display = 'none';
   }
 
+  // Returns the pixel offset inside textSpan for a given column (0‑based)
   #getColumnPixel(textSpan, col) {
-    // textSpan contains child spans (tokens). Iterate them and sum widths.
     let cur = 0;
     let x = 0;
     for (const child of textSpan.children) {
       const len = child.textContent.length;
-      if (cur + len >= col) {
-        // Column falls inside this token
+      if (cur + len > col) {
+        // Inside this token
         const offset = col - cur;
-        // Measure width of the substring from start of child to offset
         const range = document.createRange();
-        if (child.firstChild) {
-          range.setStart(child.firstChild, 0);
-          range.setEnd(child.firstChild, offset);
+        const textNode = child.firstChild;
+        if (textNode) {
+          range.setStart(textNode, 0);
+          range.setEnd(textNode, offset);
         }
-        const rect = range.getBoundingClientRect();
-        x += rect.width;
+        x += range.getBoundingClientRect().width;
         break;
       } else {
-        // Add full width of this token
         x += child.getBoundingClientRect().width;
         cur += len;
       }
@@ -685,7 +690,7 @@ class Edit {
     return x;
   }
 
-  // ---------- Keyboard handling (unchanged from fixed version) ----------
+  // ---------- Keyboard ----------
   #onKey(e) {
     if (this.#composing) return;
     const { line, col } = this.#cursor;
@@ -777,6 +782,7 @@ class Edit {
     this.#lines = newText.split('\n');
     this.#heights = new Array(this.#lines.length).fill(24);
     this.#history.push(cmd);
+    this.#store.dispatch('doc', { id: this.#doc.id, text: newText });  // notify preview etc.
     this.#render();
   }
 
@@ -789,6 +795,7 @@ class Edit {
     this.#doc.text = newText;
     this.#lines = newText.split('\n');
     this.#heights = new Array(this.#lines.length).fill(24);
+    this.#store.dispatch('doc', { id: this.#doc.id, text: newText });
     this.#render();
     const off = cmd.off;
     const { line, col } = this.#lineColFromOffset(off);
@@ -804,6 +811,7 @@ class Edit {
     this.#doc.text = newText;
     this.#lines = newText.split('\n');
     this.#heights = new Array(this.#lines.length).fill(24);
+    this.#store.dispatch('doc', { id: this.#doc.id, text: newText });
     this.#render();
     const off = cmd.off + cmd.text.length;
     const { line, col } = this.#lineColFromOffset(off);
@@ -815,9 +823,9 @@ class View {
   constructor(store, iframe) {
     this.store = store;
     this.iframe = iframe;
-    store.subscribe((action) => {
-      if (action === 'active' || action === 'docs') this.update();
-    });
+store.subscribe((action) => {
+  if (action === 'active' || action === 'docs' || action === 'doc') this.update();
+});
     this.update();
   }
 
