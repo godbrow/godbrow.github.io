@@ -1,81 +1,14 @@
-<!doctype html>
-<html lang="en" data-theme="system">
+<!DOCTYPE html>
+<html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-
-  <title>Vanilla Markdown Lab</title>
-
-  <!-- Styles -->
-  <link rel="stylesheet" href="./styles.css" />
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>v1 Editor</title>
+  <link rel="stylesheet" href="styles.css">
+  <!-- Service worker registered in app.js -->
 </head>
-
 <body>
-
-  <!-- =====================================================
-       APP SHELL
-       Keep semantic, minimal, and extension-friendly
-  ====================================================== -->
-
-  <main id="app">
-
-    <!--
-      EDITOR PANE
-      - textarea is intentional (no dependency editors yet)
-      - later can be replaced with contenteditable or canvas layer
-    -->
-    <textarea
-      id="editor"
-      spellcheck="false"
-      aria-label="Markdown editor"
-    ></textarea>
-
-    <!--
-      PREVIEW PANE
-      - rendered HTML output
-      - future: can become virtualized renderer
-    -->
-    <section
-      id="preview"
-      aria-label="Markdown preview"
-    ></section>
-
-  </main>
-
-  <!-- =====================================================
-       FUTURE EXTENSION POINTS (IMPORTANT)
-       These are intentionally empty hooks for:
-       - toolbar system
-       - plugin loader
-       - command palette
-  ====================================================== -->
-
-  <div id="toolbar-root" hidden></div>
-  <div id="plugin-root" hidden></div>
-
-  <!-- =====================================================
-       APP SCRIPT
-       ES module entry point
-  ====================================================== -->
-
-  <script type="module" src="./app.js"></script>
-
-  <!-- =====================================================
-       SERVICE WORKER REGISTRATION (optional)
-       kept minimal; actual sw.js handles caching
-  ====================================================== -->
-
-  <script>
-    if ("serviceWorker" in navigator) {
-      window.addEventListener("load", async () => {
-        try {
-          await navigator.serviceWorker.register("./sw.js");
-        } catch (e) {
-          console.warn("SW registration failed:", e);
-        }
-      });
-    }
-  </script>
-
+  <!-- All content dynamically generated from ui.json -->
+  <script type="module" src="app.js"></script>
 </body>
 </html>
