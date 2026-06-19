@@ -149,6 +149,13 @@ body > main {
   pointer-events: none;
 }
 
+.caret {
+  animation: blink 1s step-end infinite;
+}
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
 /* ===== Token classes ===== */
 .keyword  { color: var(--keyword); }
 .string   { color: var(--string); }
