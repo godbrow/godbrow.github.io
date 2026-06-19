@@ -1,13 +1,13 @@
 /* =========================================================
-   SDUI Block Editor Kernel v3
+   SDUI Block Editor Kernel v4
    - Block-based model
    - Virtualized editor
-   - Split / merge editing
-   - Preview renderer
+   - Plugin system with lifecycle
+   - Async-safe rendering
 ========================================================= */
 
 /* =========================================================
-   STATE
+   DOCUMENT MODEL (SOURCE OF TRUTH)
 ========================================================= */
 
 const DocumentModel = {
@@ -23,7 +23,7 @@ const DocumentModel = {
 };
 
 /* =========================================================
-   BLOCK MODEL
+   BLOCK FACTORY
 ========================================================= */
 
 let globalBlockId = 0;
@@ -37,7 +37,7 @@ function createBlock(type = "paragraph", text = "") {
 }
 
 /* =========================================================
-   INITIAL PARSER (string → blocks)
+   INITIAL PARSER (text → blocks)
 ========================================================= */
 
 function parseToBlocks(text = "") {
@@ -132,6 +132,53 @@ function computeVisibleRange(blocks, scrollTop, viewportHeight) {
 }
 
 /* =========================================================
+   PLUGIN SYSTEM CORE
+========================================================= */
+
+const PluginRegistry = {
+  plugins: new Map(),
+
+  register(plugin) {
+    this.plugins.set(plugin.type, plugin);
+  },
+
+  get(type) {
+    return this.plugins.get(type);
+  }
+};
+
+class PluginInstance {
+  constructor(plugin, block, el) {
+    this.plugin = plugin;
+    this.block = block;
+    this.el = el;
+    this.abortController = new AbortController();
+  }
+
+  ctx() {
+    return {
+      signal: this.abortController.signal
+    };
+  }
+
+  mount() {
+    this.plugin.mount?.(this.block, this.el, this.ctx());
+  }
+
+  update(block) {
+    this.block = block;
+    this.plugin.update?.(this.block, this.el, this.ctx());
+  }
+
+  destroy() {
+    this.abortController.abort();
+    this.plugin.destroy?.(this.block, this.el);
+  }
+}
+
+const PluginInstances = new Map();
+
+/* =========================================================
    DOM REFERENCES
 ========================================================= */
 
@@ -139,7 +186,7 @@ let editorPanel = null;
 let previewPanel = null;
 
 /* =========================================================
-   INIT SDUI (minimal semantic loader)
+   SDUI LOADER (minimal)
 ========================================================= */
 
 async function loadUI() {
@@ -150,6 +197,7 @@ async function loadUI() {
 }
 
 function renderNode(node, parent) {
+
   switch (node.type) {
 
     case "page":
@@ -170,7 +218,42 @@ function renderNode(node, parent) {
 }
 
 /* =========================================================
-   EDITOR RENDER (virtual blocks)
+   PLUGIN RUNTIME
+========================================================= */
+
+function runPlugin(block, el) {
+
+  const plugin = PluginRegistry.get(block.type);
+
+  if (!plugin) return;
+
+  const existing = PluginInstances.get(block.id);
+
+  if (existing) {
+    existing.update(block);
+    return;
+  }
+
+  const instance = new PluginInstance(plugin, block, el);
+
+  PluginInstances.set(block.id, instance);
+
+  instance.mount();
+}
+
+function cleanupPlugins(activeIds) {
+
+  for (const [id, instance] of PluginInstances.entries()) {
+
+    if (!activeIds.has(id)) {
+      instance.destroy();
+      PluginInstances.delete(id);
+    }
+  }
+}
+
+/* =========================================================
+   EDITOR (VIRTUAL RENDER)
 ========================================================= */
 
 function renderEditorVirtual() {
@@ -180,6 +263,8 @@ function renderEditorVirtual() {
 
   container.innerHTML = "";
 
+  const activeIds = new Set();
+
   for (
     let i = VirtualState.start;
     i < VirtualState.end;
@@ -187,6 +272,8 @@ function renderEditorVirtual() {
   ) {
     const block = blocks[i];
     if (!block) continue;
+
+    activeIds.add(block.id);
 
     const el = document.createElement("div");
 
@@ -196,8 +283,7 @@ function renderEditorVirtual() {
 
     el.addEventListener("input", () => {
       block.text = el.innerText;
-
-      renderPreview();
+      syncPreviewBlock(block);
     });
 
     el.addEventListener("keydown", (e) => {
@@ -209,7 +295,7 @@ function renderEditorVirtual() {
 }
 
 /* =========================================================
-   BLOCK EDITING LOGIC (split / merge)
+   BLOCK EDITING (split / merge)
 ========================================================= */
 
 function splitBlock(block, cursorPos) {
@@ -238,13 +324,11 @@ function mergeWithPrevious(block) {
 
   const prev = blocks[index - 1];
 
-  const cursorOffset = prev.text.length;
-
   prev.text += block.text;
 
   blocks.splice(index, 1);
 
-  return { block: prev, cursorOffset };
+  return prev;
 }
 
 function handleBlockEditing(e, el, block) {
@@ -257,6 +341,7 @@ function handleBlockEditing(e, el, block) {
     const newBlock = splitBlock(block, cursorPos);
 
     scheduleRender();
+    renderPreview();
 
     focusBlock(newBlock);
   }
@@ -264,46 +349,39 @@ function handleBlockEditing(e, el, block) {
   if (e.key === "Backspace" && cursorPos === 0) {
     e.preventDefault();
 
-    const result = mergeWithPrevious(block);
+    const prev = mergeWithPrevious(block);
 
     scheduleRender();
+    renderPreview();
 
-    if (result) focusBlock(result.block);
+    if (prev) focusBlock(prev);
   }
 }
 
 function focusBlock(block) {
+
   requestAnimationFrame(() => {
     const el = editorPanel.querySelector(
       `[data-id="${block.id}"]`
     );
 
-    if (el) el.focus();
+    el?.focus();
   });
 }
 
 /* =========================================================
-   PREVIEW RENDERER
+   PREVIEW + PLUGINS
 ========================================================= */
 
 function renderBlock(block) {
 
-  const text = block.text;
+  const plugin = PluginRegistry.get(block.type);
 
-  switch (block.type) {
-
-    case "h1":
-      return `<h1>${text}</h1>`;
-
-    case "h2":
-      return `<h2>${text}</h2>`;
-
-    case "quote":
-      return `<blockquote>${text}</blockquote>`;
-
-    default:
-      return `<p>${text}</p>`;
+  if (plugin?.render) {
+    return plugin.render(block);
   }
+
+  return `<p>${block.text}</p>`;
 }
 
 function renderPreview() {
@@ -314,12 +392,45 @@ function renderPreview() {
 
   const blocks = DocumentModel.getBlocks();
 
-  previewPanel.innerHTML =
-    blocks.map(renderBlock).join("");
+  previewPanel.innerHTML = "";
+
+  const activeIds = new Set();
+
+  for (const block of blocks) {
+
+    activeIds.add(block.id);
+
+    const wrapper = document.createElement("div");
+
+    wrapper.dataset.blockId = block.id;
+
+    wrapper.innerHTML = renderBlock(block);
+
+    previewPanel.appendChild(wrapper);
+
+    runPlugin(block, wrapper);
+  }
+
+  cleanupPlugins(activeIds);
+}
+
+function syncPreviewBlock(block) {
+
+  const el = previewPanel.querySelector(
+    `[data-block-id="${block.id}"]`
+  );
+
+  if (!el) return;
+
+  const instance = PluginInstances.get(block.id);
+
+  if (instance) {
+    instance.update(block);
+  }
 }
 
 /* =========================================================
-   MAIN RENDER PIPELINE
+   VIRTUAL RENDER PIPELINE
 ========================================================= */
 
 function scheduleRender() {
@@ -349,8 +460,6 @@ function initEditor() {
   editorPanel.addEventListener("scroll", () => {
     scheduleRender();
   });
-
-  editorPanel.contentEditable = false;
 }
 
 /* =========================================================
