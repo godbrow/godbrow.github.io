@@ -455,34 +455,39 @@ class Edit {
   }
 
   // ---------- Click ----------
-  #onMouseDown(e) {
-    const le = e.target.closest('.line');
-    if (!le) return;
-    const line = parseInt(le.dataset.line, 10);
-    const ts = le.querySelector('.text');
-    if (!ts) { this.#setCursor(line, 0); this.#focus(); return; }
-    const cp = document.caretPositionFromPoint(e.clientX, e.clientY);
-    if (cp) {
-      let node = cp.offsetNode;
-      while (node && node !== ts) node = node.parentNode;
-      if (node === ts) {
-        let col = 0;
-        const w = document.createTreeWalker(ts, NodeFilter.SHOW_TEXT);
-        let n = w.nextNode();
-        while (n && n !== cp.offsetNode) { col += n.textContent.length; n = w.nextNode(); }
-        if (n === cp.offsetNode) col += cp.offset;
-        this.#setCursor(line, Math.min(col, (this.#lines[line] || '').length));
-        this.#focus();
-        return;
-      }
+#onMouseDown(e) {
+  // Keep the browser from stealing focus from the hidden textarea
+  e.preventDefault();
+
+  const le = e.target.closest('.line');
+  if (!le) return;
+  const line = parseInt(le.dataset.line, 10);
+  const ts = le.querySelector('.text');
+  if (!ts) { this.#setCursor(line, 0); this.#showCaret(); return; }
+
+  const cp = document.caretPositionFromPoint(e.clientX, e.clientY);
+  if (cp) {
+    let node = cp.offsetNode;
+    while (node && node !== ts) node = node.parentNode;
+    if (node === ts) {
+      let col = 0;
+      const w = document.createTreeWalker(ts, NodeFilter.SHOW_TEXT);
+      let n = w.nextNode();
+      while (n && n !== cp.offsetNode) { col += n.textContent.length; n = w.nextNode(); }
+      if (n === cp.offsetNode) col += cp.offset;
+      this.#setCursor(line, Math.min(col, (this.#lines[line] || '').length));
+      this.#showCaret();
+      return;
     }
-    // Fallback
-    const rect = ts.getBoundingClientRect();
-    const cw = 9.6;
-    const col = Math.max(0, Math.round((e.clientX - rect.left) / cw));
-    this.#setCursor(line, Math.min(col, (this.#lines[line] || '').length));
-    this.#focus();
   }
+
+  // Fallback
+  const rect = ts.getBoundingClientRect();
+  const cw = 9.6;
+  const col = Math.max(0, Math.round((e.clientX - rect.left) / cw));
+  this.#setCursor(line, Math.min(col, (this.#lines[line] || '').length));
+  this.#showCaret();
+}
 
   #focus() {
     this.#focused = true;
