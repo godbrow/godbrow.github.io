@@ -164,6 +164,13 @@ code {
   font-size: 13px;
 }
 
+mark {
+  background: #fde68a;
+  color: inherit;
+  padding: 2px 4px;
+  border-radius: 3px;
+}
+
 /* -----------------------------
    SYNTAX HIGHLIGHT (basic tokens)
 ----------------------------- */
